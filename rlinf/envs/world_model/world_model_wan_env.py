@@ -33,7 +33,7 @@ from rlinf.envs.utils import recursive_to_device
 from rlinf.envs.world_model.base_world_env import BaseWorldEnv
 from rlinf.utils.utils import nvtx_range
 
-__all__ = ["WanEnv"]
+__all__ = ["WanEnv", "ContinuousBatchingWanEnv"]
 
 
 class WanEnv(BaseWorldEnv):
@@ -1047,6 +1047,550 @@ class WanEnv(BaseWorldEnv):
             "task_descriptions": self.task_descriptions,
             "init_ee_poses": self.init_ee_poses,
             "elapsed_steps": self.elapsed_steps,
+            "prev_step_reward": self.prev_step_reward.cpu(),
+            "_is_start": self._is_start,
+            "reset_state_ids": self.reset_state_ids.cpu(),
+            "generator_state": self._generator.get_state(),
+        }
+        if self.record_metrics:
+            env_state.update(
+                {
+                    "success_once": self.success_once.cpu(),
+                    "returns": self.returns.cpu(),
+                }
+            )
+
+        buffer = io.BytesIO()
+        torch.save(env_state, buffer)
+        return buffer.getvalue()
+
+
+class ContinuousBatchingWanEnv(WanEnv):
+    """Wan world-model env with slot-level reset support.
+
+    This keeps the per-slot video histories as the source of truth. Batched
+    tensors are materialized only when the Wan pipeline or reward model needs a
+    batch input.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.profile_rollout:
+            self.profile_rollout = False
+            self._profile_buffers = None
+        self.slot_obs_histories = [None] * self.num_envs
+        self.current_obs = self.slot_obs_histories
+        self.slot_elapsed_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+
+    def _normalize_slot_indices(self, slot_indices):
+        if isinstance(slot_indices, torch.Tensor):
+            slots = slot_indices.detach().cpu().long().flatten()
+        else:
+            slots = torch.as_tensor(slot_indices, dtype=torch.long).flatten()
+        if slots.numel() == 0:
+            return slots
+        if (slots < 0).any() or (slots >= self.num_envs).any():
+            raise IndexError(
+                f"slot_indices out of range for num_envs={self.num_envs}: {slots.tolist()}"
+            )
+        return slots
+
+    def _sample_episode_indices(self, num_slots: int):
+        return torch.randint(
+            low=0,
+            high=len(self.dataset),
+            size=(num_slots,),
+            generator=self._generator,
+            dtype=torch.long,
+        ).cpu().numpy()
+
+    def _normalize_episode_indices(self, episode_indices, num_slots: int):
+        if episode_indices is None:
+            episode_indices = self._sample_episode_indices(num_slots)
+        elif isinstance(episode_indices, torch.Tensor):
+            episode_indices = episode_indices.detach().cpu().long().numpy()
+        else:
+            episode_indices = np.asarray(episode_indices, dtype=np.int64)
+
+        episode_indices = np.asarray(episode_indices, dtype=np.int64).reshape(-1)
+        if episode_indices.shape[0] != num_slots:
+            raise ValueError(
+                f"Expected {num_slots} episode_indices, got {episode_indices.shape[0]}"
+            )
+        if len(self.dataset) <= int(episode_indices.max(initial=0)):
+            raise ValueError(
+                f"episode_indices contains id outside dataset size {len(self.dataset)}"
+            )
+        if int(episode_indices.min(initial=0)) < 0:
+            raise ValueError("episode_indices must be non-negative")
+        return episode_indices
+
+    def _load_reset_slot_states(self, episode_indices):
+        img_tensors = []
+        task_descriptions = []
+        init_ee_poses = []
+        condition_actions = []
+
+        for episode_idx in episode_indices:
+            episode_idx = int(episode_idx)
+            episode_data = self.dataset[episode_idx]
+            if len(episode_data["start_items"]) == 0:
+                raise ValueError(f"Empty start_items for episode {episode_idx}")
+
+            first_frame = episode_data["start_items"][0]
+            task_descriptions.append(str(episode_data.get("task", "")))
+
+            if "image" not in first_frame:
+                raise ValueError(f"No 'image' key in frame for episode {episode_idx}")
+            img_tensor = first_frame["image"]
+            if "observation.state" in first_frame:
+                init_ee_poses.append(first_frame["observation.state"].numpy())
+            else:
+                init_ee_poses.append(None)
+
+            if img_tensor.shape[1:] != self.image_size:
+                img_tensor = img_tensor.unsqueeze(0)
+                img_tensor = F.interpolate(
+                    img_tensor,
+                    size=self.image_size,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                img_tensor = img_tensor.squeeze(0)
+
+            img_tensor = self.trans_norm(img_tensor)
+            env_img_tensor = img_tensor.unsqueeze(1).repeat(
+                1, self.condition_frame_length, 1, 1
+            )
+
+            env_condition_action = np.zeros(
+                (self.condition_frame_length, 7), dtype=np.float32
+            )
+            if self.reset_gripper_open and self.is_libero_env:
+                env_condition_action[:, -1] = -1
+
+            target_items = episode_data.get("target_items", [])
+            if len(target_items) == self.condition_frame_length - 1:
+                for target_idx, target_frame in enumerate(target_items):
+                    if "image" not in target_frame or "action" not in target_frame:
+                        raise ValueError(
+                            f"No 'image' or 'action' key in target frame for episode {episode_idx}"
+                        )
+                    target_img = target_frame["image"]
+                    if target_img.shape[1:] != self.image_size:
+                        target_img = target_img.unsqueeze(0)
+                        target_img = F.interpolate(
+                            target_img,
+                            size=self.image_size,
+                            mode="bilinear",
+                            align_corners=False,
+                        )
+                        target_img = target_img.squeeze(0)
+                    target_img = self.trans_norm(target_img)
+                    env_img_tensor[:, target_idx + 1] = target_img
+                    env_condition_action[target_idx + 1] = target_frame["action"]
+
+            img_tensors.append(env_img_tensor)
+            condition_actions.append(torch.from_numpy(env_condition_action))
+
+        stacked_imgs = torch.stack(img_tensors, dim=0).to(self.device)
+        slot_obs = stacked_imgs.unsqueeze(2).contiguous()
+        condition_action = torch.stack(condition_actions, dim=0).to(self.device)
+        return slot_obs, condition_action, task_descriptions, init_ee_poses
+
+    def _recent_slot_history(self, slot_idx: int, num_frames: int):
+        history = self.slot_obs_histories[slot_idx]
+        if history is None:
+            raise RuntimeError(f"Slot {slot_idx} has not been reset")
+        history = history.to(self.device)
+        time_len = history.shape[2]
+        if time_len >= num_frames:
+            return history[:, :, -num_frames:, :, :]
+        pad = history[:, :, :1, :, :].expand(
+            -1, -1, num_frames - time_len, -1, -1
+        )
+        return torch.cat([pad, history], dim=2)
+
+    def _refresh_image_queue(self, slot_indices=None):
+        if slot_indices is None:
+            slot_indices = range(self.num_envs)
+        for slot_idx in slot_indices:
+            slot_idx = int(slot_idx)
+            condition_frames = self._recent_slot_history(
+                slot_idx, self.condition_frame_length
+            )
+            self.image_queue[slot_idx] = [
+                condition_frames[:, 0, frame_idx : frame_idx + 1, :, :]
+                .detach()
+                .cpu()
+                for frame_idx in range(self.condition_frame_length)
+            ]
+
+    @torch.no_grad()
+    def reset(
+        self,
+        *,
+        seed: Optional[Union[int, list[int]]] = None,
+        options: Optional[dict] = {},
+        episode_indices: Optional[Union[np.ndarray, torch.Tensor]] = None,
+    ):
+        self.onload()
+        if self.is_start:
+            if self.use_fixed_reset_state_ids:
+                episode_indices = self.reset_state_ids
+            self._is_start = False
+
+        if episode_indices is None and seed is not None:
+            seed_value = seed[0] if isinstance(seed, list) else seed
+            self._generator.manual_seed(int(seed_value))
+
+        episode_indices = self._normalize_episode_indices(
+            episode_indices, self.num_envs
+        )
+        reset_obs, condition_action, task_descriptions, init_ee_poses = (
+            self._load_reset_slot_states(episode_indices)
+        )
+
+        self.slot_obs_histories = [
+            reset_obs[env_idx].contiguous() for env_idx in range(self.num_envs)
+        ]
+        self.current_obs = self.slot_obs_histories
+        self.condition_action = condition_action
+        self.task_descriptions = task_descriptions
+        self.init_ee_poses = init_ee_poses
+        self.reset_state_ids = torch.as_tensor(
+            episode_indices, dtype=torch.long, device=self.device
+        )
+        self.slot_elapsed_steps = torch.zeros(
+            self.num_envs, dtype=torch.long, device=self.device
+        )
+        self.elapsed_steps = 0
+        self._reset_metrics()
+        self._refresh_image_queue()
+        return self._wrap_obs(), {}
+
+    @torch.no_grad()
+    def reset_slots(self, slot_indices, episode_indices=None):
+        self.onload()
+        slots = self._normalize_slot_indices(slot_indices)
+        if slots.numel() == 0:
+            return self._wrap_obs()
+
+        episode_indices = self._normalize_episode_indices(
+            episode_indices, int(slots.numel())
+        )
+        reset_obs, condition_action, task_descriptions, init_ee_poses = (
+            self._load_reset_slot_states(episode_indices)
+        )
+
+        slot_device = slots.to(self.device)
+        for local_idx, slot_idx in enumerate(slots.tolist()):
+            self.slot_obs_histories[slot_idx] = reset_obs[local_idx].contiguous()
+            self.task_descriptions[slot_idx] = task_descriptions[local_idx]
+            self.init_ee_poses[slot_idx] = init_ee_poses[local_idx]
+
+        self.current_obs = self.slot_obs_histories
+        self.condition_action = self.condition_action.to(self.device)
+        self.condition_action[slot_device] = condition_action
+        self.reset_state_ids = self.reset_state_ids.to(self.device)
+        self.reset_state_ids[slot_device] = torch.as_tensor(
+            episode_indices, dtype=torch.long, device=self.device
+        )
+        self.slot_elapsed_steps = self.slot_elapsed_steps.to(self.device)
+        self.slot_elapsed_steps[slot_device] = 0
+        self.prev_step_reward = self.prev_step_reward.to(self.device)
+        self.prev_step_reward[slot_device] = 0.0
+        if self.record_metrics:
+            self.success_once = self.success_once.to(self.device)
+            self.returns = self.returns.to(self.device)
+            self.success_once[slot_device] = False
+            self.returns[slot_device] = 0.0
+
+        self._refresh_image_queue(slots.tolist())
+        self.elapsed_steps = int(self.slot_elapsed_steps.max().item())
+        return self._wrap_obs()
+
+    def _infer_next_chunk_rewards(self):
+        if self.reward_model is None:
+            raise ValueError("Reward model is not loaded")
+
+        recent_chunks = torch.stack(
+            [
+                self._recent_slot_history(env_idx, self.chunk)
+                for env_idx in range(self.num_envs)
+            ],
+            dim=0,
+        )
+        num_envs, c, v, t, h, w = recent_chunks.shape
+        extract_chunk_obs = recent_chunks.permute(0, 3, 1, 2, 4, 5)
+        extract_chunk_obs = extract_chunk_obs.reshape(
+            self.num_envs * self.chunk, 3, v, h, w
+        )
+        extract_chunk_obs = extract_chunk_obs.squeeze(2).to(self.device)
+
+        if self.cfg.reward_model.type == "ResnetRewModel":
+            with nvtx_range("env/wan_reward_model_forward"):
+                rewards = self.reward_model.predict_rew(extract_chunk_obs)
+        elif self.cfg.reward_model.type == "TaskEmbedResnetRewModel":
+            instructions = []
+            for env_idx in range(self.num_envs):
+                instructions.extend([self.task_descriptions[env_idx]] * self.chunk)
+            with nvtx_range("env/wan_reward_model_forward"):
+                rewards = self.reward_model.predict_rew(extract_chunk_obs, instructions)
+        else:
+            raise ValueError(f"Unknown reward model type: {self.cfg.reward_model.type}")
+
+        return rewards.reshape(self.num_envs, self.chunk)
+
+    def _infer_next_chunk_frames(self, actions):
+        assert actions.shape[0] == self.num_envs, (
+            f"Actions shape {actions.shape} does not match num_envs {self.num_envs}"
+        )
+
+        actions_tensor = (
+            torch.from_numpy(actions).to(self.device)
+            if isinstance(actions, np.ndarray)
+            else actions.to(self.device)
+        )
+        self.condition_action = self.condition_action.to(
+            device=actions_tensor.device, dtype=actions_tensor.dtype
+        )
+
+        if self.retain_action:
+            actions_tensor = torch.cat([self.condition_action, actions_tensor], dim=1)
+
+        self.condition_action[:, 1 : self.condition_frame_length, :] = actions_tensor[
+            :, -(self.condition_frame_length - 1) :, :
+        ]
+
+        batch_input_image = []
+        batch_input_image4 = []
+        for env_idx in range(self.num_envs):
+            imgs = []
+            for frame in self.image_queue[env_idx]:
+                frame = frame[:, 0].cpu().numpy()
+                img = np.transpose(frame, (1, 2, 0))
+                if img.max() <= 1.2:
+                    img = ((img + 1.0) / 2.0 * 255.0).clip(0, 255)
+                imgs.append(Image.fromarray(img.astype(np.uint8)))
+
+            batch_input_image.append(imgs[0])
+            batch_input_image4.append(imgs[-4:])
+
+        kwargs = {
+            "seed": 0,
+            "tiled": False,
+            "input_image": batch_input_image,
+            "input_image4": batch_input_image4,
+            "action": actions_tensor,
+            "height": 256,
+            "width": 256,
+            "num_frames": self.num_frames,
+            "num_inference_steps": self.num_inference_steps,
+            "cfg_scale": 1.0,
+            "progress_bar_cmd": lambda x: x,
+            "batch_size": self.num_envs,
+        }
+
+        with nvtx_range("env/wan_pipe_forward"):
+            output = self.pipe(**kwargs)
+
+        max_frames = self.condition_frame_length + self.chunk
+        for env_idx in range(self.num_envs):
+            frames = []
+            for img in output[env_idx]:
+                arr = np.asarray(img, dtype=np.float32) / 255.0
+                arr = arr * 2.0 - 1.0
+                frames.append(arr)
+
+            video = np.stack(frames, axis=0)
+            video = video.transpose(0, 3, 1, 2)
+            video = torch.from_numpy(video).transpose(0, 1)
+
+            for frame_idx in range(video.shape[1] - 4, video.shape[1]):
+                self.image_queue[env_idx][frame_idx - 8] = video[
+                    :, frame_idx : frame_idx + 1
+                ]
+
+            generated = video[:, 5:].to(
+                self.device, dtype=self.slot_obs_histories[env_idx].dtype
+            )
+            generated = generated.unsqueeze(1)
+            history = self.slot_obs_histories[env_idx].to(self.device)
+            history = torch.cat([history, generated], dim=2)
+            if history.shape[2] > max_frames:
+                history = history[:, :, -max_frames:, :, :]
+            self.slot_obs_histories[env_idx] = history.contiguous()
+
+        self.current_obs = self.slot_obs_histories
+
+    def _wrap_obs(self):
+        last_frames = torch.stack(
+            [
+                self.slot_obs_histories[env_idx].to(self.device)[:, 0, -1, :, :]
+                for env_idx in range(self.num_envs)
+            ],
+            dim=0,
+        )
+        full_image = last_frames.permute(0, 2, 3, 1)
+        full_image = (full_image + 1.0) / 2.0 * 255.0
+        full_image = torch.clamp(full_image.float(), 0, 255)
+        if full_image.shape[1:3] != self.image_size:
+            full_image = full_image.permute(0, 3, 1, 2)
+            full_image = F.interpolate(
+                full_image, size=self.image_size, mode="bilinear", align_corners=False
+            )
+            full_image = full_image.permute(0, 2, 3, 1)
+
+        states = torch.zeros((self.num_envs, 16), device=self.device, dtype=torch.float32)
+        return {
+            "main_images": full_image.to(torch.uint8),
+            "wrist_images": None,
+            "states": states,
+            "task_descriptions": self.task_descriptions,
+        }
+
+    def _handle_auto_reset(self, dones, extracted_obs, infos):
+        final_obs = extracted_obs
+        final_info = infos
+        done_slots = torch.nonzero(dones.detach().cpu().bool(), as_tuple=False).flatten()
+        if done_slots.numel() > 0:
+            extracted_obs = self.reset_slots(done_slots)
+
+        infos = {
+            "final_observation": final_obs,
+            "final_info": final_info,
+            "_final_info": dones,
+            "_final_observation": dones,
+            "_elapsed_steps": dones,
+        }
+        return extracted_obs, infos
+
+    def _record_metrics(self, step_reward, terminations, infos):
+        episode_info = {}
+        self.returns += step_reward
+        if isinstance(terminations, torch.Tensor):
+            self.success_once = self.success_once | terminations
+        else:
+            terminations_tensor = torch.tensor(
+                terminations, device=self.device, dtype=torch.bool
+            )
+            self.success_once = self.success_once | terminations_tensor
+
+        episode_info["success_once"] = self.success_once.clone()
+        episode_info["return"] = self.returns.clone()
+        episode_len = self.slot_elapsed_steps.to(self.device).float().clamp_min(1.0)
+        episode_info["episode_len"] = episode_len
+        episode_info["reward"] = episode_info["return"] / episode_len
+        infos["episode"] = episode_info
+        return infos
+
+    @torch.no_grad()
+    def chunk_step(self, policy_output_action):
+        self.onload()
+        autocast_context = (
+            torch.amp.autocast(device_type=self.device.type, dtype=torch.bfloat16)
+            if self.device.type != "cpu"
+            else nullcontext()
+        )
+        with autocast_context:
+            with nvtx_range("env/wan_infer_next_chunk_frames"):
+                self._infer_next_chunk_frames(policy_output_action)
+
+        self.slot_elapsed_steps = self.slot_elapsed_steps.to(self.device)
+        self.slot_elapsed_steps += self.chunk
+        self.elapsed_steps = int(self.slot_elapsed_steps.max().item())
+
+        extracted_obs = self._wrap_obs()
+        with nvtx_range("env/wan_infer_next_chunk_rewards"):
+            chunk_rewards = self._infer_next_chunk_rewards()
+        chunk_rewards_tensors = self._calc_step_reward(chunk_rewards)
+
+        estimated_success = self._estimate_success_from_rewards(chunk_rewards)
+        raw_chunk_terminations = torch.zeros(
+            self.num_envs, self.chunk, dtype=torch.bool, device=self.device
+        )
+        raw_chunk_terminations[:, -1] = estimated_success
+
+        raw_chunk_truncations = torch.zeros(
+            self.num_envs, self.chunk, dtype=torch.bool, device=self.device
+        )
+        truncations = self.slot_elapsed_steps >= int(self.cfg.max_episode_steps)
+        if truncations.any():
+            raw_chunk_truncations[:, -1] = truncations
+
+        past_terminations = raw_chunk_terminations.any(dim=1)
+        past_truncations = raw_chunk_truncations.any(dim=1)
+        past_dones = torch.logical_or(past_terminations, past_truncations)
+
+        infos = self._record_metrics(
+            chunk_rewards_tensors.sum(dim=1), past_terminations, {}
+        )
+        if past_dones.any() and self.auto_reset:
+            extracted_obs, infos = self._handle_auto_reset(
+                past_dones, extracted_obs, infos
+            )
+
+        chunk_terminations = torch.zeros_like(raw_chunk_terminations)
+        chunk_terminations[:, -1] = past_terminations
+        chunk_truncations = torch.zeros_like(raw_chunk_truncations)
+        chunk_truncations[:, -1] = past_truncations
+
+        return (
+            [extracted_obs],
+            chunk_rewards_tensors,
+            chunk_terminations,
+            chunk_truncations,
+            [infos],
+        )
+
+    def offload(self):
+        if self._is_offloaded:
+            return
+        self.pipe.vae = self.pipe.vae.to("cpu")
+        self.pipe.dit = self.pipe.dit.to("cpu")
+        self.reward_model = self.reward_model.to("cpu")
+        self.slot_obs_histories = recursive_to_device(self.slot_obs_histories, "cpu")
+        self.current_obs = self.slot_obs_histories
+        self.condition_action = self.condition_action.cpu()
+        self.prev_step_reward = self.prev_step_reward.cpu()
+        self.reset_state_ids = self.reset_state_ids.cpu()
+        self.slot_elapsed_steps = self.slot_elapsed_steps.cpu()
+        if self.record_metrics:
+            self.success_once = self.success_once.cpu()
+            self.returns = self.returns.cpu()
+        self._clear_accelerator_cache()
+        self._is_offloaded = True
+
+    def onload(self):
+        if not self._is_offloaded:
+            return
+        self.pipe.dit = self.pipe.dit.to(self.device)
+        self.pipe.vae = self.pipe.vae.to(self.device)
+        self.reward_model = self.reward_model.to(self.device)
+        self.slot_obs_histories = recursive_to_device(
+            self.slot_obs_histories, self.device
+        )
+        self.current_obs = self.slot_obs_histories
+        self.condition_action = self.condition_action.to(self.device)
+        self.prev_step_reward = self.prev_step_reward.to(self.device)
+        self.reset_state_ids = self.reset_state_ids.to(self.device)
+        self.slot_elapsed_steps = self.slot_elapsed_steps.to(self.device)
+        if self.record_metrics:
+            self.success_once = self.success_once.to(self.device)
+            self.returns = self.returns.to(self.device)
+        self._is_offloaded = False
+
+    def get_state(self) -> bytes:
+        env_state = {
+            "current_obs": recursive_to_device(self.slot_obs_histories, "cpu"),
+            "slot_obs_histories": recursive_to_device(self.slot_obs_histories, "cpu"),
+            "task_descriptions": self.task_descriptions,
+            "init_ee_poses": self.init_ee_poses,
+            "elapsed_steps": self.elapsed_steps,
+            "slot_elapsed_steps": self.slot_elapsed_steps.cpu(),
             "prev_step_reward": self.prev_step_reward.cpu(),
             "_is_start": self._is_start,
             "reset_state_ids": self.reset_state_ids.cpu(),

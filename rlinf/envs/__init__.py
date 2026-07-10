@@ -119,6 +119,16 @@ def get_env_cls(env_type: str, env_cfg=None):
 
         return OpenSoraEnv
     elif env_type == SupportedEnvType.WANWM:
+        if (
+            env_cfg is not None
+            and env_cfg.get("continuous_batching", {}).get("enabled", False)
+        ):
+            from rlinf.envs.world_model.world_model_wan_env import (
+                ContinuousBatchingWanEnv,
+            )
+
+            return ContinuousBatchingWanEnv
+
         from rlinf.envs.world_model.world_model_wan_env import WanEnv
 
         return WanEnv
