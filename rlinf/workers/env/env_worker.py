@@ -25,6 +25,7 @@ from rlinf.algorithms.registry import calculate_adv_and_returns
 from rlinf.algorithms.rlt.transition import update_rlt_transitions
 from rlinf.data.embodied_io_struct import (
     ChunkStepResult,
+    ContinuousBatchingRolloutCollector,
     EmbodiedRolloutResult,
     EnvOutput,
     RolloutResult,
@@ -111,6 +112,14 @@ class EnvWorker(Worker):
             train_env_cfg.rollout_epoch if train_env_cfg is not None else 1
         )
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
+        continuous_batching_cfg = (
+            train_env_cfg.get("continuous_batching", {})
+            if train_env_cfg is not None
+            else {}
+        )
+        self.continuous_batching_enabled = bool(
+            continuous_batching_cfg.get("enabled", False)
+        )
 
         self.train_enable_offload = (
             train_env_cfg.get("enable_offload", False)
@@ -467,6 +476,80 @@ class EnvWorker(Worker):
             rlt_switch_flags=rlt_switch_flags,
         )
         return env_output, env_info
+
+    def _build_slot_metadata(
+        self,
+        *,
+        rollout_epoch_id: int,
+        stage_id: int,
+        is_active: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Build batch-slot metadata without changing rollout execution."""
+        num_slots = self.train_num_envs_per_stage
+        group_size = int(self.cfg.algorithm.group_size)
+        groups_per_epoch = int(self.cfg.env.train.total_num_envs // group_size)
+
+        local_slot_ids = torch.arange(num_slots, dtype=torch.long)
+        global_slot_offset = (
+            self._rank * self.train_batch_size
+            + stage_id * self.train_num_envs_per_stage
+        )
+        global_slot_ids = local_slot_ids + int(global_slot_offset)
+
+        reset_state_ids = get_env_attr(
+            self.env_list[stage_id], "reset_state_ids", None
+        )
+        if isinstance(reset_state_ids, torch.Tensor):
+            reset_state_ids = reset_state_ids.detach().cpu().long()
+        elif reset_state_ids is not None:
+            reset_state_ids = torch.as_tensor(reset_state_ids, dtype=torch.long)
+        else:
+            reset_state_ids = torch.full((num_slots,), -1, dtype=torch.long)
+
+        if reset_state_ids.numel() != num_slots:
+            raise ValueError(
+                f"Expected {num_slots} reset_state_ids for slot metadata, "
+                f"got {reset_state_ids.numel()}"
+            )
+
+        active = is_active.detach().cpu().bool()
+        if active.numel() != num_slots:
+            raise ValueError(
+                f"Expected {num_slots} active flags for slot metadata, "
+                f"got {active.numel()}"
+            )
+
+        group_ids = rollout_epoch_id * groups_per_epoch + global_slot_ids // group_size
+
+        return {
+            "slot_id": local_slot_ids.reshape(num_slots, 1),
+            "group_id": group_ids.reshape(num_slots, 1),
+            "group_member_id": (global_slot_ids % group_size).reshape(num_slots, 1),
+            "reset_state_id": reset_state_ids.reshape(num_slots, 1),
+            "rollout_epoch_id": torch.full(
+                (num_slots, 1), rollout_epoch_id, dtype=torch.long
+            ),
+            "is_active": active.reshape(num_slots, 1),
+        }
+
+    @staticmethod
+    def _update_active_slots(
+        is_active: torch.Tensor, dones: torch.Tensor | None
+    ) -> torch.Tensor:
+        if dones is None:
+            return is_active
+        dones = dones.detach().cpu().bool()
+        if dones.dim() > 1:
+            dones = dones.any(dim=tuple(range(1, dones.dim())))
+        return is_active & (~dones)
+
+    def _new_rollout_collector(self):
+        collector_cls = (
+            ContinuousBatchingRolloutCollector
+            if self.continuous_batching_enabled
+            else EmbodiedRolloutResult
+        )
+        return collector_cls(max_episode_length=self.cfg.env.train.max_episode_steps)
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
@@ -934,16 +1017,20 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
-        self.rollout_results: list[EmbodiedRolloutResult] = [
-            EmbodiedRolloutResult(
-                max_episode_length=self.cfg.env.train.max_episode_steps,
-            )
-            for _ in range(self.stage_num)
+        self.rollout_results = [
+            self._new_rollout_collector() for _ in range(self.stage_num)
         ]
         env_metrics = defaultdict(list)
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
 
         for epoch in range(self.rollout_epoch):
+            active_slot_masks = None
+            if self.continuous_batching_enabled:
+                active_slot_masks = [
+                    torch.ones(self.train_num_envs_per_stage, dtype=torch.bool)
+                    for _ in range(self.stage_num)
+                ]
+
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
@@ -989,6 +1076,13 @@ class EnvWorker(Worker):
                     rewards = self.compute_bootstrap_rewards(
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
+                    slot_metadata = {}
+                    if self.continuous_batching_enabled:
+                        slot_metadata = self._build_slot_metadata(
+                            rollout_epoch_id=epoch,
+                            stage_id=stage_id,
+                            is_active=active_slot_masks[stage_id],
+                        )
                     chunk_step_result = ChunkStepResult(
                         actions=rollout_result.forward_inputs.get("action", None),
                         prev_logprobs=(
@@ -1007,6 +1101,7 @@ class EnvWorker(Worker):
                         truncations=env_output.truncations,
                         terminations=env_output.terminations,
                         rewards=rewards,
+                        slot_metadata=slot_metadata,
                     )
                     self.rollout_results[stage_id].append_step_result(chunk_step_result)
                     if (
@@ -1031,6 +1126,10 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
+                    if self.continuous_batching_enabled:
+                        active_slot_masks[stage_id] = self._update_active_slots(
+                            active_slot_masks[stage_id], env_output.dones
+                        )
                     env_batch = env_output.to_dict()
                     data = {
                         "obs": env_batch["obs"],
@@ -1102,6 +1201,13 @@ class EnvWorker(Worker):
                 rewards = self.compute_bootstrap_rewards(
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
+                slot_metadata = {}
+                if self.continuous_batching_enabled:
+                    slot_metadata = self._build_slot_metadata(
+                        rollout_epoch_id=epoch,
+                        stage_id=stage_id,
+                        is_active=active_slot_masks[stage_id],
+                    )
                 chunk_step_result = ChunkStepResult(
                     prev_values=(
                         rollout_result.prev_values if self.collect_prev_infos else None
@@ -1110,6 +1216,7 @@ class EnvWorker(Worker):
                     truncations=env_output.truncations,
                     terminations=env_output.terminations,
                     rewards=rewards,
+                    slot_metadata=slot_metadata,
                 )
                 self.rollout_results[stage_id].append_step_result(chunk_step_result)
                 if (
@@ -1131,11 +1238,8 @@ class EnvWorker(Worker):
                 await self.send_rollout_trajectories_pipeline(
                     self.rollout_results, actor_channel
                 )
-                self.rollout_results: list[EmbodiedRolloutResult] = [
-                    EmbodiedRolloutResult(
-                        max_episode_length=self.cfg.env.train.max_episode_steps,
-                    )
-                    for _ in range(self.stage_num)
+                self.rollout_results = [
+                    self._new_rollout_collector() for _ in range(self.stage_num)
                 ]
 
             self.store_last_obs_and_intervened_info(env_outputs)

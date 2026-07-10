@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import io
+import json
 import os
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Union
 
@@ -29,6 +31,7 @@ from PIL import Image
 from rlinf.data.datasets.world_model import NpyTrajectoryDatasetWrapper
 from rlinf.envs.utils import recursive_to_device
 from rlinf.envs.world_model.base_world_env import BaseWorldEnv
+from rlinf.utils.utils import nvtx_range
 
 __all__ = ["WanEnv"]
 
@@ -75,6 +78,7 @@ class WanEnv(BaseWorldEnv):
 
         # load pipeline
         self.pipe = self._build_pipeline()
+        self._patch_pipeline_nvtx(self.pipe)
 
         # Load reward model if specified
         self.reward_model = self._load_reward_model().eval().to(self.device)
@@ -115,6 +119,210 @@ class WanEnv(BaseWorldEnv):
         )
 
         self._is_offloaded = False
+        self._init_rollout_profile()
+
+    def _init_rollout_profile(self):
+        profile_cfg = self.cfg.get("profile", {})
+        self.profile_rollout = bool(
+            profile_cfg.get("profile_rollout", self.cfg.get("profile_rollout", False))
+        )
+        self._profile_run_dir = None
+        self._profile_buffers = None
+        self._profile_episode_ids = [0] * self.num_envs
+
+        if not self.profile_rollout:
+            return
+
+        repo_root = Path(__file__).resolve().parents[3]
+        profile_root = Path(
+            profile_cfg.get("rollout_dir", repo_root / "profile" / "rollout")
+        )
+        run_id = (
+            profile_cfg.get("run_id")
+            or os.environ.get("RLINF_PROFILE_RUN_ID")
+            or datetime.now().strftime("%Y%m%d-%H%M%S")
+        )
+        worker_rank = self._profile_worker_rank()
+        self._profile_run_dir = (
+            profile_root / run_id / f"env_rank_{worker_rank:04d}_pid_{os.getpid()}"
+        )
+        self._profile_run_dir.mkdir(parents=True, exist_ok=True)
+
+    def _profile_worker_rank(self):
+        if self.worker_info is None:
+            return 0
+        return int(getattr(self.worker_info, "rank", 0))
+
+    def _profile_tensor_to_uint8_frames(self, frames):
+        """Convert normalized frames to uint8 with channel-last layout."""
+        if isinstance(frames, torch.Tensor):
+            frames = frames.detach().cpu().float().numpy()
+        if frames.ndim == 5 and frames.shape[1] == 3:
+            frames = np.transpose(frames, (0, 2, 3, 4, 1))
+        elif frames.ndim == 4 and frames.shape[0] == 3:
+            frames = np.transpose(frames, (1, 2, 3, 0))
+        elif frames.shape[-1] != 3:
+            raise ValueError(
+                f"Unexpected frame shape for rollout profile: {frames.shape}"
+            )
+
+        if frames.max() <= 1.2 and frames.min() >= -1.2:
+            frames = (frames + 1.0) * 127.5
+        frames = np.clip(frames, 0, 255).astype(np.uint8)
+        return frames
+
+    def _profile_actions_to_numpy(self, actions):
+        if isinstance(actions, torch.Tensor):
+            return actions.detach().cpu().numpy()
+        return np.asarray(actions)
+
+    def _profile_start_trajectories(self, episode_indices=None):
+        if not self.profile_rollout:
+            return
+
+        initial_frames = self._profile_tensor_to_uint8_frames(
+            self.current_obs[:, :, 0, :, :, :]
+        )
+        if episode_indices is None:
+            episode_indices = self.reset_state_ids.detach().cpu().numpy()
+        elif isinstance(episode_indices, torch.Tensor):
+            episode_indices = episode_indices.detach().cpu().numpy()
+        else:
+            episode_indices = np.asarray(episode_indices)
+
+        self._profile_buffers = []
+        for env_idx in range(self.num_envs):
+            self._profile_buffers.append(
+                {
+                    "env_index": env_idx,
+                    "worker_rank": self._profile_worker_rank(),
+                    "episode_id": self._profile_episode_ids[env_idx],
+                    "reset_state_id": int(episode_indices[env_idx]),
+                    "task_description": self.task_descriptions[env_idx],
+                    "actions": [],
+                    "rewards": [],
+                    "frames": [frame for frame in initial_frames[env_idx]],
+                    "chunk_index": 0,
+                    "success": False,
+                    "success_action_index": None,
+                    "success_chunk_index": None,
+                    "success_action_in_chunk": None,
+                    "flushed": False,
+                }
+            )
+            self._profile_episode_ids[env_idx] += 1
+
+    def _profile_record_chunk(
+        self, actions, chunk_frames, chunk_rewards, past_truncations
+    ):
+        if (
+            not self.profile_rollout
+            or self._profile_buffers is None
+            or self._profile_run_dir is None
+        ):
+            return
+
+        actions_np = self._profile_actions_to_numpy(actions)
+        frames_np = self._profile_tensor_to_uint8_frames(chunk_frames)
+        rewards_np = chunk_rewards.detach().cpu().float().numpy()
+        truncations_np = past_truncations.detach().cpu().numpy().astype(bool)
+        success_threshold = getattr(self.cfg, "success_reward_threshold", 0.9)
+
+        for env_idx, buffer in enumerate(self._profile_buffers):
+            if buffer["flushed"]:
+                continue
+
+            success_steps = np.flatnonzero(rewards_np[env_idx] >= success_threshold)
+            if len(success_steps) > 0:
+                keep_steps = int(success_steps[0]) + 1
+                buffer["success"] = True
+                buffer["success_action_index"] = len(buffer["actions"]) + keep_steps - 1
+                buffer["success_chunk_index"] = buffer["chunk_index"]
+                buffer["success_action_in_chunk"] = keep_steps - 1
+            else:
+                keep_steps = actions_np.shape[1]
+
+            buffer["actions"].extend(actions_np[env_idx, :keep_steps])
+            buffer["rewards"].extend(rewards_np[env_idx, :keep_steps])
+            buffer["frames"].extend(frames_np[env_idx, :keep_steps])
+
+            should_flush = buffer["success"] or bool(truncations_np[env_idx])
+            if should_flush:
+                self._profile_flush_trajectory(
+                    env_idx, "success" if buffer["success"] else "truncated"
+                )
+            else:
+                buffer["chunk_index"] += 1
+
+    def _profile_flush_trajectory(self, env_idx, done_reason):
+        buffer = self._profile_buffers[env_idx]
+        if buffer["flushed"] or self._profile_run_dir is None:
+            return
+
+        traj_dir = self._profile_run_dir / (
+            f"traj_env{env_idx:04d}_ep{buffer['episode_id']:06d}"
+        )
+        frames_dir = traj_dir / "frames"
+        frames_dir.mkdir(parents=True, exist_ok=True)
+
+        actions = np.asarray(buffer["actions"], dtype=np.float32)
+        rewards = np.asarray(buffer["rewards"], dtype=np.float32)
+        np.savez_compressed(
+            traj_dir / "actions.npz",
+            actions=actions,
+            rewards=rewards,
+            success=np.asarray(buffer["success"], dtype=np.bool_),
+            success_action_index=np.asarray(
+                -1
+                if buffer["success_action_index"] is None
+                else buffer["success_action_index"],
+                dtype=np.int64,
+            ),
+            success_chunk_index=np.asarray(
+                -1
+                if buffer["success_chunk_index"] is None
+                else buffer["success_chunk_index"],
+                dtype=np.int64,
+            ),
+            success_action_in_chunk=np.asarray(
+                -1
+                if buffer["success_action_in_chunk"] is None
+                else buffer["success_action_in_chunk"],
+                dtype=np.int64,
+            ),
+        )
+
+        for frame_idx, frame in enumerate(buffer["frames"]):
+            Image.fromarray(frame).save(frames_dir / f"{frame_idx:06d}.png")
+
+        metadata = {
+            "env_index": buffer["env_index"],
+            "worker_rank": buffer["worker_rank"],
+            "episode_id": buffer["episode_id"],
+            "reset_state_id": buffer["reset_state_id"],
+            "task_description": buffer["task_description"],
+            "done_reason": done_reason,
+            "num_actions": int(actions.shape[0]),
+            "num_frames": len(buffer["frames"]),
+            "success": buffer["success"],
+            "success_action_index": buffer["success_action_index"],
+            "success_chunk_index": buffer["success_chunk_index"],
+            "success_action_in_chunk": buffer["success_action_in_chunk"],
+            "success_reward_threshold": getattr(
+                self.cfg, "success_reward_threshold", 0.9
+            ),
+        }
+        with open(traj_dir / "metadata.json", "w", encoding="utf-8") as f:
+            json.dump(metadata, f, indent=2, ensure_ascii=False)
+
+        buffer["flushed"] = True
+
+    def _profile_flush_active_trajectories(self, done_reason):
+        if not self.profile_rollout or self._profile_buffers is None:
+            return
+        for env_idx, buffer in enumerate(self._profile_buffers):
+            if not buffer["flushed"] and len(buffer["actions"]) > 0:
+                self._profile_flush_trajectory(env_idx, done_reason)
 
     def _build_dataset(self, cfg):
         return NpyTrajectoryDatasetWrapper(
@@ -135,6 +343,42 @@ class WanEnv(BaseWorldEnv):
         pipe.dit.to(self.device)
         pipe.vae.to(self.device)
         return pipe
+
+    def _patch_pipeline_nvtx(self, pipe):
+        """Add NVTX ranges to Wan internals without modifying diffsynth sources."""
+        if getattr(pipe, "_rlinf_nvtx_patched", False):
+            return
+
+        unit_runner = pipe.unit_runner
+
+        class NvtxUnitRunner:
+            def __init__(self, runner):
+                self._runner = runner
+
+            def __call__(self, *args, **kwargs):
+                with nvtx_range("env/wan_pipeline_units"):
+                    return self._runner(*args, **kwargs)
+
+        pipe.unit_runner = NvtxUnitRunner(unit_runner)
+
+        model_fn = pipe.model_fn
+
+        def nvtx_model_fn(*args, **kwargs):
+            with nvtx_range("env/wan_dit_forward"):
+                return model_fn(*args, **kwargs)
+
+        pipe.model_fn = nvtx_model_fn
+
+        if getattr(pipe, "vae", None) is not None:
+            vae_decode = pipe.vae.decode
+
+            def nvtx_vae_decode(*args, **kwargs):
+                with nvtx_range("env/wan_vae_decode"):
+                    return vae_decode(*args, **kwargs)
+
+            pipe.vae.decode = nvtx_vae_decode
+
+        pipe._rlinf_nvtx_patched = True
 
     def _load_reward_model(self):
         if self.cfg.reward_model.type == "ResnetRewModel":
@@ -253,6 +497,7 @@ class WanEnv(BaseWorldEnv):
         episode_indices: Optional[Union[np.ndarray, torch.Tensor]] = None,
     ):
         self.onload()
+        self._profile_flush_active_trajectories("reset")
         self.elapsed_steps = 0
 
         # Handle first reset with fixed reset state ids
@@ -428,6 +673,7 @@ class WanEnv(BaseWorldEnv):
         # Store init_ee_poses
         self.task_descriptions = task_descriptions
         self.init_ee_poses = init_ee_poses
+        self._profile_start_trajectories(episode_indices=episode_indices)
 
         # Wrap observation to match libero_env format
         extracted_obs = self._wrap_obs()
@@ -462,7 +708,8 @@ class WanEnv(BaseWorldEnv):
             )  # [num_envs * chunk, 3, h, w]
             extract_chunk_obs = extract_chunk_obs.to(self.device)
 
-            rewards = self.reward_model.predict_rew(extract_chunk_obs)
+            with nvtx_range("env/wan_reward_model_forward"):
+                rewards = self.reward_model.predict_rew(extract_chunk_obs)
             rewards = rewards.reshape(self.num_envs, self.chunk)
         elif self.cfg.reward_model.type == "TaskEmbedResnetRewModel":
             extract_chunk_obs = extract_chunk_obs[
@@ -485,7 +732,8 @@ class WanEnv(BaseWorldEnv):
                 instructions.extend([task_desc] * self.chunk)
 
             # Predict rewards with instruction conditioning
-            rewards = self.reward_model.predict_rew(extract_chunk_obs, instructions)
+            with nvtx_range("env/wan_reward_model_forward"):
+                rewards = self.reward_model.predict_rew(extract_chunk_obs, instructions)
             rewards = rewards.reshape(self.num_envs, self.chunk)
         else:
             raise ValueError(f"Unknown reward model type: {self.cfg.reward_model.type}")
@@ -552,7 +800,8 @@ class WanEnv(BaseWorldEnv):
             "batch_size": B,
         }
 
-        output = self.pipe(**kwargs)
+        with nvtx_range("env/wan_pipe_forward"):
+            output = self.pipe(**kwargs)
         for env_idx in range(num_envs):
             frames = []
             for img in output[env_idx]:
@@ -672,7 +921,13 @@ class WanEnv(BaseWorldEnv):
             else nullcontext()
         )
         with autocast_context:
-            self._infer_next_chunk_frames(policy_output_action)
+            with nvtx_range("env/wan_infer_next_chunk_frames"):
+                self._infer_next_chunk_frames(policy_output_action)
+        profile_chunk_frames = None
+        if self.profile_rollout:
+            profile_chunk_frames = (
+                self.current_obs[:, :, 0, -self.chunk :, :, :].detach().cpu()
+            )
 
         # Update elapsed steps (incremented after inference)
         # print(f'elapsed_steps:{self.elapsed_steps}')
@@ -682,7 +937,8 @@ class WanEnv(BaseWorldEnv):
         extracted_obs = self._wrap_obs()
 
         # Get rewards
-        chunk_rewards = self._infer_next_chunk_rewards()
+        with nvtx_range("env/wan_infer_next_chunk_rewards"):
+            chunk_rewards = self._infer_next_chunk_rewards()
         chunk_rewards_tensors = self._calc_step_reward(chunk_rewards)
 
         # Estimate success (terminations) based on rewards
@@ -707,6 +963,14 @@ class WanEnv(BaseWorldEnv):
         past_terminations = raw_chunk_terminations.any(dim=1)
         past_truncations = raw_chunk_truncations.any(dim=1)
         past_dones = torch.logical_or(past_terminations, past_truncations)
+
+        if self.profile_rollout:
+            self._profile_record_chunk(
+                policy_output_action,
+                profile_chunk_frames,
+                chunk_rewards,
+                past_truncations,
+            )
 
         if past_dones.any() and self.auto_reset:
             extracted_obs, infos = self._handle_auto_reset(

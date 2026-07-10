@@ -362,6 +362,7 @@ class ChunkStepResult:
     rewards: torch.Tensor = None  # [B, 1]
     forward_inputs: dict[str, torch.Tensor] = field(default_factory=dict)
     versions: torch.Tensor = None  # [B, 1]
+    slot_metadata: dict[str, torch.Tensor] = field(default_factory=dict)
 
     def __post_init__(self):
         if self.actions is not None:
@@ -378,6 +379,8 @@ class ChunkStepResult:
             self.truncations = self.truncations.cpu().contiguous()
         if self.rewards is not None:
             self.rewards = self.rewards.cpu().contiguous()
+        if self.slot_metadata:
+            self.slot_metadata = put_tensor_device(self.slot_metadata, "cpu")
         if self.forward_inputs:
             self.forward_inputs = put_tensor_device(self.forward_inputs, "cpu")
         if self.versions is not None:
@@ -402,6 +405,7 @@ class Trajectory:
     prev_values: torch.Tensor = None
     versions: torch.Tensor = None
     forward_inputs: dict[str, Any] = field(default_factory=dict)
+    slot_metadata: dict[str, Any] = field(default_factory=dict)
 
     curr_obs: dict[str, Any] = field(default_factory=dict)
     next_obs: dict[str, Any] = field(default_factory=dict)
@@ -485,6 +489,7 @@ class Trajectory:
             intervene_flags = apply_mask(self.intervene_flags, i)
 
             forward_inputs = apply_mask_to_dict(self.forward_inputs, i)
+            slot_metadata = apply_mask_to_dict(self.slot_metadata, i)
             curr_obs = apply_mask_to_dict(self.curr_obs, i)
             next_obs = apply_mask_to_dict(self.next_obs, i)
 
@@ -510,6 +515,7 @@ class Trajectory:
                     prev_logprobs=prev_logprobs,
                     prev_values=prev_values,
                     forward_inputs=forward_inputs,
+                    slot_metadata=slot_metadata,
                     curr_obs=curr_obs,
                     next_obs=next_obs,
                 )
@@ -549,6 +555,9 @@ class EmbodiedRolloutResult:
     forward_inputs: list[dict[str, Any]] = field(
         default_factory=list
     )  # trajectory_length
+    slot_metadata: list[dict[str, torch.Tensor]] = field(
+        default_factory=list
+    )  # trajectory_length
 
     curr_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
     next_obs: list[dict[str, Any]] = field(default_factory=list)  # trajectory_length
@@ -575,6 +584,8 @@ class EmbodiedRolloutResult:
             self.versions.append(result.versions)
         if result.forward_inputs:
             self.forward_inputs.append(result.forward_inputs)
+        if result.slot_metadata:
+            self.slot_metadata.append(result.slot_metadata)
 
     def mark_last_step_with_flags(self, save_flags: torch.Tensor):
         if not self.intervene_flags:
@@ -654,6 +665,7 @@ class EmbodiedRolloutResult:
         self.prev_values.clear()
         self.versions.clear()
         self.forward_inputs.clear()
+        self.slot_metadata.clear()
         self.curr_obs.clear()
         self.next_obs.clear()
 
@@ -695,6 +707,12 @@ class EmbodiedRolloutResult:
             for key in trajectory.forward_inputs.keys():
                 trajectory.forward_inputs[key] = (
                     trajectory.forward_inputs[key].cpu().contiguous()
+                )
+        if len(self.slot_metadata) > 0:
+            trajectory.slot_metadata = stack_list_of_dict_tensor(self.slot_metadata)
+            for key in trajectory.slot_metadata.keys():
+                trajectory.slot_metadata[key] = (
+                    trajectory.slot_metadata[key].cpu().contiguous()
                 )
 
         if len(self.curr_obs) > 0:
@@ -743,6 +761,16 @@ class EmbodiedRolloutResult:
             for i in range(split_size):
                 splited_trajectories[i].forward_inputs = splited_forward_inputs[i]
 
+        if (
+            all_trajectory.slot_metadata is not None
+            and len(all_trajectory.slot_metadata) > 0
+        ):
+            splited_slot_metadata = split_dict_to_chunk(
+                all_trajectory.slot_metadata, split_size, dim=1
+            )
+            for i in range(split_size):
+                splited_trajectories[i].slot_metadata = splited_slot_metadata[i]
+
         for field_name in all_trajectory.__dataclass_fields__.keys():
             value = getattr(all_trajectory, field_name)
 
@@ -769,6 +797,315 @@ class EmbodiedRolloutResult:
         self, split_sizes: list[int]
     ) -> list[Trajectory]:
         trajectory = self.to_trajectory()
+        trajectories = [Trajectory() for _ in split_sizes]
+
+        for field_name in trajectory.__dataclass_fields__:
+            value = getattr(trajectory, field_name)
+            if value is None:
+                continue
+            if isinstance(value, (int, str)):
+                for split_trajectory in trajectories:
+                    setattr(split_trajectory, field_name, value)
+            elif isinstance(value, torch.Tensor):
+                for split_trajectory, split_value in zip(
+                    trajectories, torch.split(value, split_sizes, dim=1)
+                ):
+                    setattr(split_trajectory, field_name, split_value.contiguous())
+            elif isinstance(value, dict):
+                for split_trajectory, split_value in zip(
+                    trajectories, split_dict(value, split_sizes, dim=1)
+                ):
+                    setattr(split_trajectory, field_name, split_value)
+            else:
+                raise ValueError(
+                    f"Unsupported value type: {type(value)} for field_name: {field_name}"
+                )
+
+        return trajectories
+
+
+class ContinuousBatchingRolloutCollector:
+    """
+    Trajectory-major rollout collector used as a stepping stone for slot-level
+    continuous batching.
+
+    During collection, each batch slot is appended to the trajectory identified
+    by ``(group_id, group_member_id)`` in ``ChunkStepResult.slot_metadata``.
+    When exported, trajectories are sorted by that key and rebuilt into the
+    legacy time-major ``Trajectory`` format: [T, B, ...].
+    """
+
+    def __init__(self, max_episode_length: int = 0):
+        self.max_episode_length = max_episode_length
+        self._buffers: dict[tuple[int, int], EmbodiedRolloutResult] = {}
+        self._slot_keys: list[tuple[int, int]] = []
+        self._key_to_epoch_slot: dict[tuple[int, int], tuple[int, int]] = {}
+        self.group_to_trajectory_keys: dict[int, set[tuple[int, int]]] = {}
+
+    @staticmethod
+    def _slice_batch_value(value: Any, slot_idx: int) -> Any:
+        if value is None:
+            return None
+        if isinstance(value, torch.Tensor):
+            return value[slot_idx : slot_idx + 1].contiguous()
+        if isinstance(value, dict):
+            return {
+                key: ContinuousBatchingRolloutCollector._slice_batch_value(
+                    item, slot_idx
+                )
+                for key, item in value.items()
+            }
+        if isinstance(value, list):
+            return [value[slot_idx]]
+        return value
+
+    @staticmethod
+    def _infer_batch_size(result: ChunkStepResult) -> int:
+        for value in (
+            result.actions,
+            result.rewards,
+            result.dones,
+            result.terminations,
+            result.truncations,
+            result.prev_logprobs,
+            result.prev_values,
+            result.versions,
+        ):
+            if isinstance(value, torch.Tensor):
+                return int(value.shape[0])
+        for data in (result.forward_inputs, result.slot_metadata):
+            for value in data.values():
+                if isinstance(value, torch.Tensor):
+                    return int(value.shape[0])
+        raise ValueError("Cannot infer batch size from ChunkStepResult.")
+
+    @staticmethod
+    def _metadata_key(
+        slot_metadata: dict[str, torch.Tensor], slot_idx: int
+    ) -> tuple[int, int]:
+        group_id = int(slot_metadata["group_id"][slot_idx].reshape(-1)[0].item())
+        group_member_id = int(
+            slot_metadata["group_member_id"][slot_idx].reshape(-1)[0].item()
+        )
+        return group_id, group_member_id
+
+    @staticmethod
+    def _metadata_epoch_slot(
+        slot_metadata: dict[str, torch.Tensor], slot_idx: int
+    ) -> tuple[int, int]:
+        rollout_epoch_id = int(
+            slot_metadata["rollout_epoch_id"][slot_idx].reshape(-1)[0].item()
+        )
+        slot_id = int(slot_metadata["slot_id"][slot_idx].reshape(-1)[0].item())
+        return rollout_epoch_id, slot_id
+
+    def _get_buffer(
+        self, key: tuple[int, int], epoch_slot: tuple[int, int] | None = None
+    ) -> EmbodiedRolloutResult:
+        if key not in self._buffers:
+            self._buffers[key] = EmbodiedRolloutResult(
+                max_episode_length=self.max_episode_length
+            )
+            self.group_to_trajectory_keys.setdefault(key[0], set()).add(key)
+            if epoch_slot is not None:
+                self._key_to_epoch_slot[key] = epoch_slot
+        elif epoch_slot is not None and self._key_to_epoch_slot.get(key) != epoch_slot:
+            raise ValueError(
+                f"Trajectory key {key} changed epoch/slot from "
+                f"{self._key_to_epoch_slot.get(key)} to {epoch_slot}"
+            )
+        return self._buffers[key]
+
+    def append_step_result(self, result: ChunkStepResult):
+        if not result.slot_metadata:
+            raise ValueError(
+                "ContinuousBatchingRolloutCollector requires slot_metadata for every ChunkStepResult."
+            )
+
+        batch_size = self._infer_batch_size(result)
+        self._slot_keys = []
+        for slot_idx in range(batch_size):
+            key = self._metadata_key(result.slot_metadata, slot_idx)
+            epoch_slot = self._metadata_epoch_slot(result.slot_metadata, slot_idx)
+            self._slot_keys.append(key)
+            slot_result = ChunkStepResult(
+                actions=self._slice_batch_value(result.actions, slot_idx),
+                prev_logprobs=self._slice_batch_value(result.prev_logprobs, slot_idx),
+                prev_values=self._slice_batch_value(result.prev_values, slot_idx),
+                dones=self._slice_batch_value(result.dones, slot_idx),
+                truncations=self._slice_batch_value(result.truncations, slot_idx),
+                terminations=self._slice_batch_value(result.terminations, slot_idx),
+                rewards=self._slice_batch_value(result.rewards, slot_idx),
+                forward_inputs=self._slice_batch_value(
+                    result.forward_inputs, slot_idx
+                ),
+                versions=self._slice_batch_value(result.versions, slot_idx),
+                slot_metadata=self._slice_batch_value(
+                    result.slot_metadata, slot_idx
+                ),
+            )
+            self._get_buffer(key, epoch_slot).append_step_result(slot_result)
+
+    def mark_last_step_with_flags(self, save_flags: torch.Tensor):
+        if not self._slot_keys:
+            return
+        for slot_idx, key in enumerate(self._slot_keys):
+            self._get_buffer(key).mark_last_step_with_flags(
+                save_flags[slot_idx : slot_idx + 1]
+            )
+
+    def update_last_actions(
+        self, intervene_actions: torch.Tensor, intervene_flags: torch.Tensor
+    ):
+        if not self._slot_keys:
+            return
+        for slot_idx, key in enumerate(self._slot_keys):
+            self._get_buffer(key).update_last_actions(
+                intervene_actions[slot_idx : slot_idx + 1],
+                intervene_flags[slot_idx : slot_idx + 1],
+            )
+
+    def append_transitions(self, curr_obs=None, next_obs=None):
+        assert curr_obs is not None and next_obs is not None
+        if not self._slot_keys:
+            raise ValueError(
+                "Cannot append transitions before appending a slot-metadata step."
+            )
+        for slot_idx, key in enumerate(self._slot_keys):
+            self._get_buffer(key).append_transitions(
+                self._slice_batch_value(curr_obs, slot_idx),
+                self._slice_batch_value(next_obs, slot_idx),
+            )
+
+    def clear(self):
+        for buffer in self._buffers.values():
+            buffer.clear()
+        self._buffers.clear()
+        self._slot_keys.clear()
+        self._key_to_epoch_slot.clear()
+        self.group_to_trajectory_keys.clear()
+
+    @staticmethod
+    def _cat_nested_batches(epoch_batches: list[dict[str, Any]]) -> dict[str, Any]:
+        if not epoch_batches:
+            return {}
+        merged: dict[str, Any] = {}
+        keys = set()
+        for batch in epoch_batches:
+            keys.update(batch.keys())
+        for key in keys:
+            values = [batch[key] for batch in epoch_batches if key in batch]
+            if not values:
+                continue
+            if isinstance(values[0], torch.Tensor):
+                merged[key] = torch.cat(values, dim=0).contiguous()
+            elif isinstance(values[0], dict):
+                merged[key] = ContinuousBatchingRolloutCollector._cat_nested_batches(
+                    values
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported value type while concatenating trajectory batches: {type(values[0])}"
+                )
+        return merged
+
+    def _epoch_batches(self) -> list[dict[str, Any]]:
+        if not self._buffers:
+            return []
+        keys_by_epoch: dict[int, list[tuple[int, int]]] = {}
+        for key in self._buffers:
+            if key not in self._key_to_epoch_slot:
+                raise ValueError(f"Missing rollout epoch/slot metadata for key {key}")
+            epoch_id, _ = self._key_to_epoch_slot[key]
+            keys_by_epoch.setdefault(epoch_id, []).append(key)
+
+        epoch_batches = []
+        for epoch_id in sorted(keys_by_epoch):
+            ordered_keys = sorted(
+                keys_by_epoch[epoch_id],
+                key=lambda key: self._key_to_epoch_slot[key][1],
+            )
+            trajectories = [
+                self._buffers[key].to_trajectory() for key in ordered_keys
+            ]
+            epoch_batches.append(convert_trajectories_to_batch(trajectories))
+        return epoch_batches
+
+    def to_trajectory(self) -> Trajectory:
+        epoch_batches = self._epoch_batches()
+        if not epoch_batches:
+            return Trajectory(max_episode_length=self.max_episode_length)
+
+        batch = self._cat_nested_batches(epoch_batches)
+        trajectory = Trajectory(max_episode_length=self.max_episode_length)
+        for key, value in batch.items():
+            setattr(trajectory, key, value)
+        trajectory.model_weights_id = get_model_weights_id(
+            trajectory.versions
+            if trajectory.versions is not None
+            else torch.zeros(1, dtype=torch.float32)
+        )
+        return trajectory
+
+    def to_splited_trajectories(self, split_size: int) -> list[Trajectory]:
+        trajectory = self.to_trajectory()
+        return self._split_trajectory_by_chunks(trajectory, split_size)
+
+    def to_splited_trajectories_by_sizes(
+        self, split_sizes: list[int]
+    ) -> list[Trajectory]:
+        trajectory = self.to_trajectory()
+        return self._split_trajectory_by_sizes(trajectory, split_sizes)
+
+    @staticmethod
+    def _split_trajectory_by_chunks(
+        trajectory: Trajectory, split_size: int
+    ) -> list[Trajectory]:
+        trajectories = [Trajectory() for _ in range(split_size)]
+
+        if len(trajectory.curr_obs) > 0:
+            split_obs = split_dict_to_chunk(trajectory.curr_obs, split_size, dim=1)
+            for i in range(split_size):
+                trajectories[i].curr_obs = split_obs[i]
+        if len(trajectory.next_obs) > 0:
+            split_obs = split_dict_to_chunk(trajectory.next_obs, split_size, dim=1)
+            for i in range(split_size):
+                trajectories[i].next_obs = split_obs[i]
+        if trajectory.forward_inputs is not None and len(trajectory.forward_inputs) > 0:
+            split_forward_inputs = split_dict_to_chunk(
+                trajectory.forward_inputs, split_size, dim=1
+            )
+            for i in range(split_size):
+                trajectories[i].forward_inputs = split_forward_inputs[i]
+        if trajectory.slot_metadata is not None and len(trajectory.slot_metadata) > 0:
+            split_slot_metadata = split_dict_to_chunk(
+                trajectory.slot_metadata, split_size, dim=1
+            )
+            for i in range(split_size):
+                trajectories[i].slot_metadata = split_slot_metadata[i]
+
+        for field_name in trajectory.__dataclass_fields__.keys():
+            value = getattr(trajectory, field_name)
+            if value is None or isinstance(value, dict):
+                continue
+            if isinstance(value, (int, str)):
+                for split_trajectory in trajectories:
+                    setattr(split_trajectory, field_name, value)
+            elif isinstance(value, torch.Tensor):
+                chunks = torch.chunk(value, split_size, dim=1)
+                for split_trajectory, split_value in zip(trajectories, chunks):
+                    setattr(split_trajectory, field_name, split_value.contiguous())
+            else:
+                raise ValueError(
+                    f"Unsupported value type: {type(value)} for field_name: {field_name}"
+                )
+
+        return trajectories
+
+    @staticmethod
+    def _split_trajectory_by_sizes(
+        trajectory: Trajectory, split_sizes: list[int]
+    ) -> list[Trajectory]:
         trajectories = [Trajectory() for _ in split_sizes]
 
         for field_name in trajectory.__dataclass_fields__:
@@ -845,6 +1182,20 @@ def convert_trajectories_to_batch(
             ]
             if tensors:
                 batch["forward_inputs"][key] = torch.cat(tensors, dim=1)
+
+    if trajectories[0].slot_metadata:
+        all_keys: set[str] = set()
+        for traj in trajectories:
+            all_keys.update(traj.slot_metadata.keys())
+        batch["slot_metadata"] = {}
+        for key in all_keys:
+            tensors = [
+                traj.slot_metadata[key]
+                for traj in trajectories
+                if key in traj.slot_metadata
+            ]
+            if tensors:
+                batch["slot_metadata"][key] = torch.cat(tensors, dim=1)
 
     # -------- tensor fields --------
     reference_trajectory = trajectories[0]

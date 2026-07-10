@@ -33,6 +33,7 @@ from rlinf.models import get_model
 from rlinf.models.embodiment.base_policy import BasePolicy
 from rlinf.scheduler import Channel, Cluster, Worker, split_channel_message
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.utils import nvtx_range
 
 
 class MultiStepRolloutWorker(Worker):
@@ -508,16 +509,18 @@ class MultiStepRolloutWorker(Worker):
             expert_label_flag = False
             # Decide which model to act via use_expert
             if use_expert:
-                actions, result = self.expert_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
-                )
+                with nvtx_range(f"rollout/{mode}/expert_predict"):
+                    actions, result = self.expert_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
                 expert_label_flag = True
             else:
-                actions, result = self.hf_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
-                )
+                with nvtx_range(f"rollout/{mode}/vla_predict"):
+                    actions, result = self.hf_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
 
             # Decide re-label or not
             if (
@@ -526,10 +529,11 @@ class MultiStepRolloutWorker(Worker):
                 and self.expert_model is not None  # only re-label if expert exists
                 and mode == "train"  # only re-label in train mode
             ):
-                _, expert_result = self.expert_model.predict_action_batch(
-                    env_obs=env_obs,
-                    **kwargs,
-                )
+                with nvtx_range(f"rollout/{mode}/expert_relabel_predict"):
+                    _, expert_result = self.expert_model.predict_action_batch(
+                        env_obs=env_obs,
+                        **kwargs,
+                    )
                 expert_forward_inputs = expert_result["forward_inputs"]
                 expert_target = expert_forward_inputs.get(
                     "model_action", expert_forward_inputs.get("action")

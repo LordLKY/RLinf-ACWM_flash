@@ -79,6 +79,7 @@ from rlinf.utils.utils import (
     cpu_weight_swap,
     get_loss_agg_func,
     masked_mean,
+    nvtx_range,
     reshape_entropy,
     retrieve_model_state_dict_in_cpu,
 )
@@ -1405,7 +1406,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
                 self.torch_platform.empty_cache()
 
-                grad_norm, lr_list = self.optimizer_step()
+                with nvtx_range("actor/optimizer_step"):
+                    grad_norm, lr_list = self.optimizer_step()
                 data = {
                     "actor/grad_norm": grad_norm,
                     "actor/lr": lr_list[0],
@@ -1458,14 +1460,15 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         compute_values = self.cfg.algorithm.adv_type == "gae"
         with self.amp_context:
-            output_dict = self.model(
-                forward_inputs=forward_inputs,
-                compute_logprobs=True,
-                compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
-                compute_values=compute_values,
-                use_cache=False,
-                **kwargs,
-            )
+            with nvtx_range("actor/forward"):
+                output_dict = self.model(
+                    forward_inputs=forward_inputs,
+                    compute_logprobs=True,
+                    compute_entropy=self.cfg.algorithm.entropy_bonus > 0,
+                    compute_values=compute_values,
+                    use_cache=False,
+                    **kwargs,
+                )
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.GR00T,
@@ -1511,7 +1514,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                     self.cfg.algorithm.clip_log_ratio_max
                 )
 
-        loss, metrics_data = policy_loss(**loss_kwargs)
+        with nvtx_range("actor/policy_loss"):
+            loss, metrics_data = policy_loss(**loss_kwargs)
         entropy_loss = torch.tensor(0.0, device=Worker.torch_platform.current_device())
         if self.cfg.algorithm.entropy_bonus > 0 and not loss_kwargs["critic_warmup"]:
             entropy = output_dict["entropy"]
@@ -1530,7 +1534,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
 
         loss /= self.gradient_accumulation
         with backward_ctx:
-            self.grad_scaler.scale(loss).backward()
+            with nvtx_range("actor/backward"):
+                self.grad_scaler.scale(loss).backward()
 
         metrics_data["actor/total_loss"] = loss.detach().item()
         append_to_dict(metrics, metrics_data)

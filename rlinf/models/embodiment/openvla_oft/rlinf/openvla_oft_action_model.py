@@ -35,6 +35,7 @@ from rlinf.models.embodiment.modules.value_head import ValueHead
 from rlinf.utils.utils import (
     compute_entropy_from_logits,
     compute_logprobs_from_logits,
+    nvtx_range,
 )
 
 
@@ -312,24 +313,26 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )  # [B, L + act + 1]
 
         # multimodal
-        mm_embeddings, mm_attention_mask = self._build_embedding(
-            input_ids, attention_mask, pixel_values
-        )
+        with nvtx_range("rollout/openvla_build_embedding"):
+            mm_embeddings, mm_attention_mask = self._build_embedding(
+                input_ids, attention_mask, pixel_values
+            )
         multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
 
         # Forward pass through language model
-        outputs = self.language_model(
-            input_ids=None,
-            attention_mask=mm_attention_mask,
-            position_ids=multimodal_position_ids,
-            past_key_values=None,
-            inputs_embeds=mm_embeddings,
-            labels=None,
-            use_cache=None,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
+        with nvtx_range("rollout/openvla_language_model_forward"):
+            outputs = self.language_model(
+                input_ids=None,
+                attention_mask=mm_attention_mask,
+                position_ids=multimodal_position_ids,
+                past_key_values=None,
+                inputs_embeds=mm_embeddings,
+                labels=None,
+                use_cache=None,
+                output_attentions=False,
+                output_hidden_states=True,
+                return_dict=True,
+            )
 
         # Extract hidden states for action tokens
         last_hidden_states = outputs.hidden_states[-1]  # (B, seq_len, D)

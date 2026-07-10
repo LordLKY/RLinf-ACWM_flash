@@ -33,7 +33,14 @@ else
 fi
 
 # NOTE: Set the active robot platform (required for correct action dimension and normalization), supported platforms are LIBERO, ALOHA, BRIDGE, default is LIBERO
-ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
+SECOND_ARG=${2:-""}
+if [[ "${SECOND_ARG,,}" == "true" || "${SECOND_ARG}" == "1" || "${SECOND_ARG,,}" == "yes" || "${SECOND_ARG,,}" == "false" || "${SECOND_ARG}" == "0" || "${SECOND_ARG,,}" == "no" ]]; then
+    ROBOT_PLATFORM=${ROBOT_PLATFORM:-"LIBERO"}
+    USE_NSYS=${SECOND_ARG}
+else
+    ROBOT_PLATFORM=${SECOND_ARG:-${ROBOT_PLATFORM:-"LIBERO"}}
+    USE_NSYS=${3:-${USE_NSYS:-"false"}}
+fi
 
 export ROBOT_PLATFORM
 
@@ -46,11 +53,21 @@ elif [ "$LIBERO_TYPE" == "plus" ]; then
 fi
 
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
+echo "Using USE_NSYS=$USE_NSYS"
 
 echo "Using Python at $(which python)"
 LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')-${CONFIG_NAME}" #/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/run_embodiment.log"
 mkdir -p "${LOG_DIR}"
+NSYS_DIR="${REPO_PATH}/profile/nsys"
+mkdir -p "${NSYS_DIR}"
 CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
+if [[ "${USE_NSYS,,}" == "true" || "${USE_NSYS}" == "1" || "${USE_NSYS,,}" == "yes" ]]; then
+    export RLINF_USE_NVTX=1
+    NSYS_OUTPUT="${NSYS_DIR}/$(date +'%Y%m%d-%H%M%S')-${CONFIG_NAME}"
+    CMD="nsys profile --force-overwrite=true --trace=cuda,cudnn,cublas,nvtx --sample=none --cpuctxsw=none --cuda-memory-usage=false --output=${NSYS_OUTPUT} ${CMD}"  # --trace=cuda,cudnn,cublas,nvtx,osrt --sample=process-tree --cpuctxsw=process-tree --cuda-memory-usage=true --osrt-threshold=1000 
+else
+    export RLINF_USE_NVTX=0
+fi
 echo ${CMD} > ${MEGA_LOG_FILE}
 ${CMD} 2>&1 | tee -a ${MEGA_LOG_FILE}
