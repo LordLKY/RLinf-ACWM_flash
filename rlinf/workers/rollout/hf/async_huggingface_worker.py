@@ -78,8 +78,11 @@ class AsyncMultiStepRolloutWorker(MultiStepRolloutWorker):
                 if self._background_weight_sync_active:
                     await self._poll_background_weight_sync()
 
-                for _ in range(self.rollout_epoch):
-                    await self.generate_one_epoch(input_channel, output_channel)
+                if self.continuous_batching_enabled:
+                    await self.generate_continuous(input_channel, output_channel)
+                else:
+                    for _ in range(self.rollout_epoch):
+                        await self.generate_one_epoch(input_channel, output_channel)
                 if self.finished_episodes is not None:
                     self.finished_episodes += (
                         self.total_num_train_envs * self.rollout_epoch

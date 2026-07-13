@@ -71,6 +71,14 @@ class MultiStepRolloutWorker(Worker):
         self.rollout_epoch = (
             train_env_cfg.rollout_epoch if train_env_cfg is not None else 1
         )
+        continuous_batching_cfg = (
+            train_env_cfg.get("continuous_batching", {})
+            if train_env_cfg is not None
+            else {}
+        )
+        self.continuous_batching_enabled = bool(
+            continuous_batching_cfg.get("enabled", False)
+        )
         self.eval_rollout_epoch = eval_env_cfg.rollout_epoch if self.enable_eval else 1
         self.collect_transitions = self.cfg.rollout.get("collect_transitions", False)
         self.expert_model = None
@@ -724,6 +732,69 @@ class MultiStepRolloutWorker(Worker):
                 split_fn=self._split_rollout_result,
             )
 
+    @Worker.timer("generate_continuous")
+    async def generate_continuous(self, input_channel: Channel, output_channel: Channel):
+        self.update_dagger_beta()
+        stopped_stages = [False for _ in range(self.num_pipeline_stages)]
+        while not all(stopped_stages):
+            for stage_id in range(self.num_pipeline_stages):
+                if stopped_stages[stage_id]:
+                    continue
+                env_output = await self.recv_from(
+                    group_name=self.cfg.env.group_name,
+                    channel=input_channel,
+                    tag="train_rollout_results",
+                    route_key=stage_id,
+                    async_op=True,
+                    batch_size=self.train_batch_size,
+                    merge_fn=self._merge_obs_batches,
+                    infer_batch_size_fn=self._infer_env_batch_size,
+                ).async_wait()
+                continuous_done = bool(env_output.get("continuous_done", False))
+                if continuous_done:
+                    stopped_stages[stage_id] = True
+                    continue
+
+                actions, result = self._predict_rollout_actions(
+                    env_output["obs"],
+                    final_obs=None,
+                    rlt_switch_flags=env_output.get("rlt_switch_flags", None),
+                )
+
+                save_flags = None
+                if result.get("expert_label_flag", False):
+                    save_flags = torch.full(
+                        (actions.shape[0], self.model_cfg.num_action_chunks),
+                        True,
+                        dtype=torch.bool,
+                        device=actions.device,
+                    )
+                rollout_result = RolloutResult(
+                    actions=actions,
+                    prev_logprobs=result["prev_logprobs"]
+                    if self.collect_prev_infos
+                    else None,
+                    prev_values=None,
+                    bootstrap_values=None,
+                    save_flags=save_flags,
+                    forward_inputs=result["forward_inputs"],
+                    versions=torch.full_like(
+                        result["prev_logprobs"],
+                        float(self.version),
+                        dtype=torch.float32,
+                    ),
+                )
+                self.send_to(
+                    group_name=self.cfg.env.group_name,
+                    channel=output_channel,
+                    data=rollout_result,
+                    tag="train_rollout_results",
+                    route_key=stage_id,
+                    async_op=True,
+                    batch_size=self.train_batch_size,
+                    split_fn=self._split_rollout_result,
+                )
+
     @Worker.timer("rollout/generate")
     async def generate(
         self,
@@ -733,12 +804,15 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.reload_model()
 
-        for _ in tqdm(
-            range(self.rollout_epoch),
-            desc="Generating Rollout Epochs",
-            disable=(self._rank != 0),
-        ):
-            await self.generate_one_epoch(input_channel, output_channel)
+        if self.continuous_batching_enabled:
+            await self.generate_continuous(input_channel, output_channel)
+        else:
+            for _ in tqdm(
+                range(self.rollout_epoch),
+                desc="Generating Rollout Epochs",
+                disable=(self._rank != 0),
+            ):
+                await self.generate_one_epoch(input_channel, output_channel)
 
         if self.enable_offload:
             self.offload_model()
@@ -856,6 +930,15 @@ class MultiStepRolloutWorker(Worker):
         rlt_switch_flags_list = [
             obs_batch.get("rlt_switch_flags", None) for obs_batch in obs_batches
         ]
+        continuous_done_flags = [
+            bool(obs_batch.get("continuous_done", False)) for obs_batch in obs_batches
+        ]
+        if any(continuous_done_flags) and not all(continuous_done_flags):
+            raise RuntimeError(
+                "continuous_batching received a partial stop across merged env "
+                "shards. Use one-to-one env/rollout placement for continuous batching."
+            )
+        continuous_done = all(continuous_done_flags)
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -902,6 +985,7 @@ class MultiStepRolloutWorker(Worker):
             "obs": merged_obs,
             "final_obs": merged_final_obs,
             "rlt_switch_flags": merged_rlt_switch_flags,
+            "continuous_done": continuous_done,
         }
 
     def _split_rollout_result(

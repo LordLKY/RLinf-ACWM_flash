@@ -14,6 +14,7 @@
 
 import asyncio
 import gc
+from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Any
 
@@ -52,6 +53,365 @@ from rlinf.utils.utils import (
     preprocess_embodied_batch,
 )
 from rlinf.workers.env.history_manager import HistoryManager
+
+
+@dataclass
+class SlotGroupState:
+    group_id: int
+    reset_state_id: int | None = None
+    is_dummy: bool = False
+    member_trajectory_ids: list[int] = field(default_factory=list)
+    completed_member_count: int = 0
+    completed_trajectory_ids: set[int] = field(default_factory=set)
+    complete: bool = False
+
+
+class EnvSlotStateManager:
+    """Tracks long-lived slot, trajectory, and GRPO group state.
+
+    This is bookkeeping only. It marks slots/trajectories/groups done, but does
+    not reset or reuse any slot.
+    """
+
+    def __init__(
+        self,
+        *,
+        num_slots: int,
+        group_size: int,
+        stage_id: int,
+        rank: int,
+        total_num_envs: int,
+        train_batch_size: int,
+        train_num_envs_per_stage: int,
+        reset_state_ids: torch.Tensor,
+    ):
+        if num_slots <= 0:
+            raise ValueError(f"num_slots must be positive, got {num_slots}")
+        if group_size <= 0:
+            raise ValueError(f"group_size must be positive, got {group_size}")
+
+        self.num_slots = int(num_slots)
+        self.group_size = int(group_size)
+        self.stage_id = int(stage_id)
+        self.total_num_envs = int(total_num_envs)
+        if self.total_num_envs % self.group_size != 0:
+            raise ValueError(
+                f"total_num_envs={self.total_num_envs} must be divisible by "
+                f"group_size={self.group_size}"
+            )
+
+        self.slot_ids = torch.arange(self.num_slots, dtype=torch.long)
+        global_slot_offset = (
+            int(rank) * int(train_batch_size)
+            + int(stage_id) * int(train_num_envs_per_stage)
+        )
+        self.global_slot_ids = self.slot_ids + global_slot_offset
+        if int(self.global_slot_ids[0].item()) % self.group_size != 0:
+            raise ValueError(
+                "Continuous batching currently expects each EnvWorker stage to "
+                "start on a group boundary. "
+                f"Got global_slot_offset={int(self.global_slot_ids[0].item())}, "
+                f"group_size={self.group_size}."
+            )
+        if self.num_slots % self.group_size != 0:
+            raise ValueError(
+                "Continuous batching currently expects each EnvWorker stage to "
+                f"own complete groups. Got num_slots={self.num_slots}, "
+                f"group_size={self.group_size}."
+            )
+
+        self.group_id_stride = self.total_num_envs // self.group_size
+        self.local_num_groups = self.num_slots // self.group_size
+        self.initial_group_id = int(self.global_slot_ids[0].item()) // self.group_size
+        self.next_group_id = self.initial_group_id + self.group_id_stride
+        self.next_trajectory_id = self.next_group_id * self.group_size
+
+        self.group_ids = torch.empty(self.num_slots, dtype=torch.long)
+        self.group_member_ids = torch.empty(self.num_slots, dtype=torch.long)
+        self.trajectory_ids = torch.empty(self.num_slots, dtype=torch.long)
+        self.assignment_rounds = torch.zeros(self.num_slots, dtype=torch.long)
+
+        self.active = torch.ones(self.num_slots, dtype=torch.bool)
+        self.done = torch.zeros(self.num_slots, dtype=torch.bool)
+        self.reset_state_ids = self._normalize_reset_state_ids(reset_state_ids)
+
+        self.groups: dict[int, SlotGroupState] = {}
+        self.real_group_ids: set[int] = set()
+        self.dummy_group_ids: set[int] = set()
+        self.target_real_group_count: int | None = None
+        self.created_real_group_count = 0
+        self.completed_real_group_ids: set[int] = set()
+        self.ready_group_ids: list[int] = []
+        self.ready_group_id_set: set[int] = set()
+        self.done_slot_ids: set[int] = set()
+        self.free_slot_ids: set[int] = set()
+        self.slot_to_trajectory_id: dict[int, int] = {}
+        self.slot_to_group_id: dict[int, int] = {}
+        self.slot_to_group_member_id: dict[int, int] = {}
+        self.trajectory_done: dict[int, bool] = {}
+        self.trajectory_to_group_id: dict[int, int] = {}
+        self.open_group_id: int | None = None
+        self._assign_initial_slots()
+
+    def _assign_initial_slots(self) -> None:
+        trajectory_id = self.initial_group_id * self.group_size
+        for local_group_idx in range(self.local_num_groups):
+            group_id = self.initial_group_id + local_group_idx
+            group = self.groups.setdefault(
+                group_id,
+                SlotGroupState(
+                    group_id,
+                    reset_state_id=int(
+                        self.reset_state_ids[local_group_idx * self.group_size].item()
+                    ),
+                ),
+            )
+            self.real_group_ids.add(group_id)
+            self.created_real_group_count += 1
+            for member_id in range(self.group_size):
+                slot_idx = local_group_idx * self.group_size + member_id
+                self.group_ids[slot_idx] = group_id
+                self.group_member_ids[slot_idx] = member_id
+                self.trajectory_ids[slot_idx] = trajectory_id
+
+                self.slot_to_trajectory_id[slot_idx] = trajectory_id
+                self.slot_to_group_id[slot_idx] = group_id
+                self.slot_to_group_member_id[slot_idx] = member_id
+                self.trajectory_done[trajectory_id] = False
+                self.trajectory_to_group_id[trajectory_id] = group_id
+                group.member_trajectory_ids.append(trajectory_id)
+                trajectory_id += 1
+
+    def _normalize_reset_state_ids(self, reset_state_ids: torch.Tensor) -> torch.Tensor:
+        reset_state_ids = torch.as_tensor(reset_state_ids, dtype=torch.long).cpu()
+        if reset_state_ids.numel() != self.num_slots:
+            raise ValueError(
+                f"Expected {self.num_slots} reset_state_ids, "
+                f"got {reset_state_ids.numel()}"
+            )
+        return reset_state_ids.reshape(self.num_slots)
+
+    @staticmethod
+    def _done_mask(dones: torch.Tensor | None, num_slots: int) -> torch.Tensor:
+        if dones is None:
+            return torch.zeros(num_slots, dtype=torch.bool)
+        done_mask = dones.detach().cpu().bool()
+        if done_mask.dim() > 1:
+            done_mask = done_mask.any(dim=tuple(range(1, done_mask.dim())))
+        done_mask = done_mask.reshape(-1)
+        if done_mask.numel() != num_slots:
+            raise ValueError(
+                f"Expected {num_slots} done flags, got {done_mask.numel()}"
+            )
+        return done_mask
+
+    def update_reset_state_ids(self, reset_state_ids: torch.Tensor) -> None:
+        self.reset_state_ids = self._normalize_reset_state_ids(reset_state_ids)
+
+    def mark_done(self, dones: torch.Tensor | None) -> torch.Tensor:
+        done_mask = self._done_mask(dones, self.num_slots)
+        newly_done = done_mask & self.active
+        for slot_idx in torch.nonzero(newly_done, as_tuple=False).flatten().tolist():
+            trajectory_id = int(self.trajectory_ids[slot_idx].item())
+            group_id = int(self.group_ids[slot_idx].item())
+            self.active[slot_idx] = False
+            self.done[slot_idx] = True
+            self.done_slot_ids.add(slot_idx)
+            self.free_slot_ids.add(slot_idx)
+            self.trajectory_done[trajectory_id] = True
+
+            group = self.groups[group_id]
+            if trajectory_id not in group.completed_trajectory_ids:
+                group.completed_trajectory_ids.add(trajectory_id)
+                group.completed_member_count += 1
+                group.complete = group.completed_member_count >= self.group_size
+                if group.complete and group_id not in self.ready_group_id_set:
+                    self.ready_group_id_set.add(group_id)
+                    self.ready_group_ids.append(group_id)
+                if group.complete and not group.is_dummy:
+                    self.completed_real_group_ids.add(group_id)
+        return newly_done
+
+    def set_target_real_group_count(self, target_group_count: int) -> None:
+        if target_group_count < self.local_num_groups:
+            raise ValueError(
+                "target_group_count must be at least the initially assigned "
+                f"local group count ({self.local_num_groups}), got {target_group_count}"
+            )
+        self.target_real_group_count = int(target_group_count)
+
+    @property
+    def completed_real_group_count(self) -> int:
+        return len(self.completed_real_group_ids)
+
+    @property
+    def target_real_groups_complete(self) -> bool:
+        if self.target_real_group_count is None:
+            return False
+        return self.completed_real_group_count >= self.target_real_group_count
+
+    def _can_create_real_group(self) -> bool:
+        return (
+            self.target_real_group_count is None
+            or self.created_real_group_count < self.target_real_group_count
+        )
+
+    def _reset_state_id_for_group(
+        self, group_id: int, num_reset_states: int
+    ) -> int:
+        if num_reset_states <= 0:
+            raise ValueError(
+                f"num_reset_states must be positive, got {num_reset_states}"
+            )
+        return (int(group_id) * self.group_size) % int(num_reset_states)
+
+    def _new_group(
+        self, num_reset_states: int, *, is_dummy: bool = False
+    ) -> SlotGroupState:
+        group_id = self.next_group_id
+        self.next_group_id += self.group_id_stride
+        group = SlotGroupState(
+            group_id,
+            reset_state_id=self._reset_state_id_for_group(
+                group_id, num_reset_states
+            ),
+            is_dummy=is_dummy,
+        )
+        self.groups[group_id] = group
+        if is_dummy:
+            self.dummy_group_ids.add(group_id)
+        else:
+            self.real_group_ids.add(group_id)
+            self.created_real_group_count += 1
+        self.open_group_id = group_id
+        return group
+
+    def reassign_slots(
+        self,
+        slot_indices: torch.Tensor | list[int],
+        num_reset_states: int,
+        *,
+        allow_real_groups: bool = True,
+    ) -> dict[str, torch.Tensor]:
+        slots = torch.as_tensor(slot_indices, dtype=torch.long).flatten().cpu()
+        if slots.numel() == 0:
+            return {
+                "slot_indices": slots,
+                "episode_indices": torch.empty(0, dtype=torch.long),
+            }
+        if (slots < 0).any() or (slots >= self.num_slots).any():
+            raise IndexError(
+                f"slot_indices out of range for num_slots={self.num_slots}: "
+                f"{slots.tolist()}"
+            )
+
+        group = (
+            self.groups.get(self.open_group_id)
+            if self.open_group_id is not None
+            else None
+        )
+        if group is not None and len(group.member_trajectory_ids) >= self.group_size:
+            group = None
+            self.open_group_id = None
+
+        assigned_reset_state_ids = []
+        assigned_group_ids = []
+        assigned_member_ids = []
+        assigned_trajectory_ids = []
+        for slot_idx in slots.tolist():
+            if slot_idx not in self.free_slot_ids:
+                raise ValueError(
+                    f"Slot {slot_idx} is not free. It must be marked done before reassignment."
+                )
+            if group is None or len(group.member_trajectory_ids) >= self.group_size:
+                create_real = allow_real_groups and self._can_create_real_group()
+                group = self._new_group(num_reset_states, is_dummy=not create_real)
+
+            member_id = len(group.member_trajectory_ids)
+            trajectory_id = self.next_trajectory_id
+            self.next_trajectory_id += 1
+            reset_state_id = int(group.reset_state_id)
+
+            self.group_ids[slot_idx] = group.group_id
+            self.group_member_ids[slot_idx] = member_id
+            self.trajectory_ids[slot_idx] = trajectory_id
+            self.assignment_rounds[slot_idx] += 1
+            self.active[slot_idx] = True
+            self.done[slot_idx] = False
+            self.reset_state_ids[slot_idx] = reset_state_id
+
+            self.free_slot_ids.discard(slot_idx)
+            self.done_slot_ids.discard(slot_idx)
+            self.slot_to_trajectory_id[slot_idx] = trajectory_id
+            self.slot_to_group_id[slot_idx] = group.group_id
+            self.slot_to_group_member_id[slot_idx] = member_id
+            self.trajectory_done[trajectory_id] = False
+            self.trajectory_to_group_id[trajectory_id] = group.group_id
+            group.member_trajectory_ids.append(trajectory_id)
+
+            assigned_reset_state_ids.append(reset_state_id)
+            assigned_group_ids.append(group.group_id)
+            assigned_member_ids.append(member_id)
+            assigned_trajectory_ids.append(trajectory_id)
+
+            if len(group.member_trajectory_ids) >= self.group_size:
+                self.open_group_id = None
+                group = None
+
+        return {
+            "slot_indices": slots,
+            "episode_indices": torch.as_tensor(
+                assigned_reset_state_ids, dtype=torch.long
+            ),
+            "group_id": torch.as_tensor(assigned_group_ids, dtype=torch.long),
+            "group_member_id": torch.as_tensor(assigned_member_ids, dtype=torch.long),
+            "trajectory_id": torch.as_tensor(assigned_trajectory_ids, dtype=torch.long),
+        }
+
+    def build_metadata(
+        self, reset_state_ids: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        if reset_state_ids is not None:
+            self.update_reset_state_ids(reset_state_ids)
+
+        group_completed_member_count = torch.tensor(
+            [
+                self.groups[int(group_id.item())].completed_member_count
+                for group_id in self.group_ids
+            ],
+            dtype=torch.long,
+        )
+        group_complete = torch.tensor(
+            [
+                self.groups[int(group_id.item())].complete
+                for group_id in self.group_ids
+            ],
+            dtype=torch.bool,
+        )
+        is_dummy = torch.tensor(
+            [
+                self.groups[int(group_id.item())].is_dummy
+                for group_id in self.group_ids
+            ],
+            dtype=torch.bool,
+        )
+
+        return {
+            "slot_id": self.slot_ids.reshape(self.num_slots, 1),
+            "trajectory_id": self.trajectory_ids.reshape(self.num_slots, 1),
+            "group_id": self.group_ids.reshape(self.num_slots, 1),
+            "group_member_id": self.group_member_ids.reshape(self.num_slots, 1),
+            "reset_state_id": self.reset_state_ids.reshape(self.num_slots, 1),
+            "rollout_epoch_id": self.assignment_rounds.reshape(self.num_slots, 1),
+            "assignment_round": self.assignment_rounds.reshape(self.num_slots, 1),
+            "is_active": self.active.reshape(self.num_slots, 1),
+            "is_done": self.done.reshape(self.num_slots, 1),
+            "is_dummy": is_dummy.reshape(self.num_slots, 1),
+            "group_complete": group_complete.reshape(self.num_slots, 1),
+            "group_completed_member_count": group_completed_member_count.reshape(
+                self.num_slots, 1
+            ),
+        }
 
 
 class EnvWorker(Worker):
@@ -120,6 +480,8 @@ class EnvWorker(Worker):
         self.continuous_batching_enabled = bool(
             continuous_batching_cfg.get("enabled", False)
         )
+        self.collect_slot_metadata = self.continuous_batching_enabled
+        self.slot_state_managers: list[EnvSlotStateManager] | None = None
 
         self.train_enable_offload = (
             train_env_cfg.get("enable_offload", False)
@@ -482,12 +844,19 @@ class EnvWorker(Worker):
         *,
         rollout_epoch_id: int,
         stage_id: int,
-        is_active: torch.Tensor,
+        is_active: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         """Build batch-slot metadata without changing rollout execution."""
         num_slots = self.train_num_envs_per_stage
         group_size = int(self.cfg.algorithm.group_size)
         groups_per_epoch = int(self.cfg.env.train.total_num_envs // group_size)
+
+        reset_state_ids = self._get_stage_reset_state_ids(stage_id)
+        if (
+            self.slot_state_managers is not None
+            and self.slot_state_managers[stage_id] is not None
+        ):
+            return self.slot_state_managers[stage_id].build_metadata(reset_state_ids)
 
         local_slot_ids = torch.arange(num_slots, dtype=torch.long)
         global_slot_offset = (
@@ -496,22 +865,8 @@ class EnvWorker(Worker):
         )
         global_slot_ids = local_slot_ids + int(global_slot_offset)
 
-        reset_state_ids = get_env_attr(
-            self.env_list[stage_id], "reset_state_ids", None
-        )
-        if isinstance(reset_state_ids, torch.Tensor):
-            reset_state_ids = reset_state_ids.detach().cpu().long()
-        elif reset_state_ids is not None:
-            reset_state_ids = torch.as_tensor(reset_state_ids, dtype=torch.long)
-        else:
-            reset_state_ids = torch.full((num_slots,), -1, dtype=torch.long)
-
-        if reset_state_ids.numel() != num_slots:
-            raise ValueError(
-                f"Expected {num_slots} reset_state_ids for slot metadata, "
-                f"got {reset_state_ids.numel()}"
-            )
-
+        if is_active is None:
+            is_active = torch.ones(num_slots, dtype=torch.bool)
         active = is_active.detach().cpu().bool()
         if active.numel() != num_slots:
             raise ValueError(
@@ -530,18 +885,123 @@ class EnvWorker(Worker):
                 (num_slots, 1), rollout_epoch_id, dtype=torch.long
             ),
             "is_active": active.reshape(num_slots, 1),
+            "is_dummy": torch.zeros((num_slots, 1), dtype=torch.bool),
         }
 
-    @staticmethod
-    def _update_active_slots(
-        is_active: torch.Tensor, dones: torch.Tensor | None
-    ) -> torch.Tensor:
-        if dones is None:
-            return is_active
-        dones = dones.detach().cpu().bool()
-        if dones.dim() > 1:
-            dones = dones.any(dim=tuple(range(1, dones.dim())))
-        return is_active & (~dones)
+    def _get_stage_reset_state_ids(self, stage_id: int) -> torch.Tensor:
+        num_slots = self.train_num_envs_per_stage
+        reset_state_ids = get_env_attr(
+            self.env_list[stage_id], "reset_state_ids", None
+        )
+        if isinstance(reset_state_ids, torch.Tensor):
+            reset_state_ids = reset_state_ids.detach().cpu().long()
+        elif reset_state_ids is not None:
+            reset_state_ids = torch.as_tensor(reset_state_ids, dtype=torch.long)
+        else:
+            reset_state_ids = torch.full((num_slots,), -1, dtype=torch.long)
+
+        if reset_state_ids.numel() != num_slots:
+            raise ValueError(
+                f"Expected {num_slots} reset_state_ids for slot metadata, "
+                f"got {reset_state_ids.numel()}"
+            )
+        return reset_state_ids.reshape(num_slots)
+
+    def _new_slot_state_manager(self, *, stage_id: int) -> EnvSlotStateManager:
+        group_size = int(self.cfg.algorithm.group_size)
+        total_num_envs = int(self.cfg.env.train.total_num_envs)
+        if total_num_envs % group_size != 0:
+            raise ValueError(
+                f"total_num_envs={total_num_envs} must be divisible by "
+                f"group_size={group_size}"
+            )
+        return EnvSlotStateManager(
+            num_slots=self.train_num_envs_per_stage,
+            group_size=group_size,
+            stage_id=stage_id,
+            rank=self._rank,
+            total_num_envs=total_num_envs,
+            train_batch_size=self.train_batch_size,
+            train_num_envs_per_stage=self.train_num_envs_per_stage,
+            reset_state_ids=self._get_stage_reset_state_ids(stage_id),
+        )
+
+    def _ensure_slot_state_managers(self) -> None:
+        if not self.collect_slot_metadata:
+            self.slot_state_managers = None
+            return
+        if self.slot_state_managers is not None:
+            return
+        self.slot_state_managers = [
+            self._new_slot_state_manager(stage_id=stage_id)
+            for stage_id in range(self.stage_num)
+        ]
+
+    def _reset_slot_state_managers(self) -> None:
+        if not self.collect_slot_metadata:
+            self.slot_state_managers = None
+            return
+        self.slot_state_managers = [
+            self._new_slot_state_manager(stage_id=stage_id)
+            for stage_id in range(self.stage_num)
+        ]
+
+    def _mark_slot_managers_done(
+        self, *, stage_id: int, dones: torch.Tensor | None
+    ) -> torch.Tensor | None:
+        if (
+            self.slot_state_managers is None
+            or self.slot_state_managers[stage_id] is None
+        ):
+            return None
+        return self.slot_state_managers[stage_id].mark_done(dones)
+
+    def _num_env_reset_states(self, stage_id: int) -> int:
+        dataset = get_env_attr(self.env_list[stage_id], "dataset", None)
+        if dataset is None:
+            raise RuntimeError(
+                "continuous_batching slot reassignment requires env.dataset "
+                "to derive reset_state_id."
+            )
+        return len(dataset)
+
+    def _reassign_done_slots(
+        self,
+        *,
+        stage_id: int,
+        newly_done: torch.Tensor | None,
+        allow_real_groups: bool = True,
+    ) -> dict[str, torch.Tensor] | None:
+        if newly_done is None or not newly_done.any():
+            return None
+        if self.slot_state_managers is None:
+            return None
+        done_slots = torch.nonzero(
+            newly_done.detach().cpu().bool(), as_tuple=False
+        ).flatten()
+        if done_slots.numel() == 0:
+            return None
+        return self.slot_state_managers[stage_id].reassign_slots(
+            done_slots,
+            num_reset_states=self._num_env_reset_states(stage_id),
+            allow_real_groups=allow_real_groups,
+        )
+
+    def _reset_reassigned_env_slots(
+        self, *, stage_id: int, reassignment: dict[str, torch.Tensor] | None
+    ) -> dict[str, Any] | None:
+        if reassignment is None:
+            return None
+        reset_slots = get_env_attr(self.env_list[stage_id], "reset_slots", None)
+        if not callable(reset_slots):
+            raise RuntimeError(
+                "continuous_batching.enabled requires env.reset_slots(...) "
+                "for slot reuse."
+            )
+        return reset_slots(
+            reassignment["slot_indices"],
+            reassignment["episode_indices"],
+        )
 
     def _new_rollout_collector(self):
         collector_cls = (
@@ -945,23 +1405,36 @@ class EnvWorker(Worker):
         self, rollout_channel: Channel, env_outputs: list[EnvOutput]
     ) -> None:
         for stage_id in range(self.stage_num):
-            env_output: EnvOutput = env_outputs[stage_id]
-            env_batch = env_output.to_dict()
-            data = {
-                "obs": env_batch["obs"],
-                "final_obs": env_batch["final_obs"],
-            }
-            if self.enable_rlt:
-                data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
-            self.send_to(
-                group_name=self.cfg.rollout.group_name,
-                channel=rollout_channel,
-                data=data,
-                mode="train",
-                tag="rollout_results",
-                route_key=stage_id if not self.env_decoupled_mode else None,
-                decoupled_mode=self.env_decoupled_mode,
+            self._send_train_env_output(
+                rollout_channel, stage_id, env_outputs[stage_id]
             )
+
+    def _send_train_env_output(
+        self,
+        rollout_channel: Channel,
+        stage_id: int,
+        env_output: EnvOutput,
+        *,
+        continuous_done: bool = False,
+    ) -> None:
+        env_batch = env_output.to_dict()
+        data = {
+            "obs": env_batch["obs"],
+            "final_obs": env_batch["final_obs"],
+        }
+        if continuous_done:
+            data["continuous_done"] = True
+        if self.enable_rlt:
+            data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
+        self.send_to(
+            group_name=self.cfg.rollout.group_name,
+            channel=rollout_channel,
+            data=data,
+            mode="train",
+            tag="rollout_results",
+            route_key=stage_id if not self.env_decoupled_mode else None,
+            decoupled_mode=self.env_decoupled_mode,
+        )
 
     def _bootstrap_and_send_train(self, rollout_channel: Channel) -> list[EnvOutput]:
         env_outputs = self.bootstrap_step()
@@ -994,6 +1467,278 @@ class EnvWorker(Worker):
             for env_output in env_output_list
         ]
 
+    def _continuous_target_groups_per_stage(self) -> int:
+        group_size = int(self.cfg.algorithm.group_size)
+        target_trajectories = self.train_num_envs_per_stage * self.rollout_epoch
+        if target_trajectories % group_size != 0:
+            raise ValueError(
+                "continuous_batching requires per-stage target trajectories to be "
+                f"divisible by group_size. Got target_trajectories={target_trajectories}, "
+                f"group_size={group_size}."
+            )
+        return target_trajectories // group_size
+
+    def _continuous_max_chunk_steps(self) -> int:
+        return max(1, self.n_train_chunk_steps * max(1, self.rollout_epoch))
+
+    def _continuous_targets_complete(self) -> bool:
+        if self.slot_state_managers is None:
+            return False
+        return all(
+            manager.target_real_groups_complete
+            for manager in self.slot_state_managers
+        )
+
+    @staticmethod
+    def _slice_metadata_slots(
+        metadata: dict[str, torch.Tensor], slot_indices: torch.Tensor | list[int]
+    ) -> dict[str, torch.Tensor]:
+        slots = torch.as_tensor(slot_indices, dtype=torch.long).flatten()
+        return {
+            key: value.index_select(0, slots.to(value.device)).cpu().contiguous()
+            for key, value in metadata.items()
+        }
+
+    def _append_continuous_initial_boundary(
+        self,
+        *,
+        stage_id: int,
+        slot_indices: torch.Tensor | list[int] | None = None,
+    ) -> None:
+        metadata = self._build_slot_metadata(rollout_epoch_id=0, stage_id=stage_id)
+        if slot_indices is not None:
+            slots = torch.as_tensor(slot_indices, dtype=torch.long).flatten()
+            if slots.numel() == 0:
+                return
+            metadata = self._slice_metadata_slots(metadata, slots)
+            num_slots = int(slots.numel())
+        else:
+            num_slots = self.train_num_envs_per_stage
+
+        dones = torch.zeros(
+            (num_slots, self.model_cfg.num_action_chunks), dtype=torch.bool
+        )
+        self.rollout_results[stage_id].append_step_result(
+            ChunkStepResult(
+                dones=dones,
+                terminations=dones.clone(),
+                truncations=dones.clone(),
+                slot_metadata=metadata,
+            )
+        )
+
+    def _append_continuous_step_result(
+        self,
+        *,
+        stage_id: int,
+        rollout_result: RolloutResult,
+        env_output: EnvOutput,
+        rewards: torch.Tensor | None,
+        slot_metadata: dict[str, torch.Tensor],
+    ) -> None:
+        chunk_step_result = ChunkStepResult(
+            actions=rollout_result.forward_inputs.get("action", None),
+            prev_logprobs=(
+                rollout_result.prev_logprobs if self.collect_prev_infos else None
+            ),
+            # Continuous batching v1 aligns with auto_reset=False and GRPO actor loss.
+            # Do not collect prev_values until final-value/bootstrap semantics are added.
+            prev_values=None,
+            forward_inputs=rollout_result.forward_inputs,
+            versions=rollout_result.versions,
+            dones=env_output.dones,
+            truncations=env_output.truncations,
+            terminations=env_output.terminations,
+            rewards=rewards,
+            slot_metadata=slot_metadata,
+        )
+        self.rollout_results[stage_id].append_step_result(chunk_step_result)
+        if rollout_result.save_flags is not None:
+            self.rollout_results[stage_id].mark_last_step_with_flags(
+                rollout_result.save_flags
+            )
+
+    def _send_continuous_stop(self, rollout_channel: Channel, env_outputs: list[EnvOutput]):
+        for stage_id, env_output in enumerate(env_outputs):
+            self._send_train_env_output(
+                rollout_channel,
+                stage_id,
+                env_output,
+                continuous_done=True,
+            )
+
+    async def _run_interact_once_continuous(
+        self,
+        input_channel: Channel,
+        rollout_channel: Channel,
+        reward_channel: Channel | None,
+        actor_channel: Channel | None,
+        *,
+        cooperative_yield: bool,
+    ) -> dict[str, torch.Tensor]:
+        if self.use_training_pipeline:
+            raise NotImplementedError(
+                "continuous_batching does not support use_training_pipeline yet."
+            )
+        if self.collect_transitions:
+            raise NotImplementedError(
+                "continuous_batching does not support collect_transitions yet."
+            )
+
+        self.rollout_results = [
+            self._new_rollout_collector() for _ in range(self.stage_num)
+        ]
+        env_metrics = defaultdict(list)
+
+        env_outputs = self.bootstrap_step()
+        self._reset_slot_state_managers()
+        target_groups_per_stage = self._continuous_target_groups_per_stage()
+        assert self.slot_state_managers is not None
+        for manager in self.slot_state_managers:
+            manager.set_target_real_group_count(target_groups_per_stage)
+
+        for stage_id in range(self.stage_num):
+            self._append_continuous_initial_boundary(stage_id=stage_id)
+            self._send_train_env_output(rollout_channel, stage_id, env_outputs[stage_id])
+
+        max_chunk_steps = self._continuous_max_chunk_steps()
+        chunk_step_idx = 0
+        stopped_stages = [False for _ in range(self.stage_num)]
+        while not all(stopped_stages):
+            if chunk_step_idx >= max_chunk_steps:
+                raise RuntimeError(
+                    "continuous_batching did not complete target groups within "
+                    f"{max_chunk_steps} chunks. Completed per stage: "
+                    f"{[m.completed_real_group_count for m in self.slot_state_managers]}, "
+                    f"target={target_groups_per_stage}."
+                )
+
+            next_env_outputs: list[EnvOutput] = [None] * self.stage_num
+            for stage_id in range(self.stage_num):
+                if stopped_stages[stage_id]:
+                    next_env_outputs[stage_id] = env_outputs[stage_id]
+                    continue
+                if cooperative_yield:
+                    await asyncio.sleep(0)
+
+                manager = self.slot_state_managers[stage_id]
+                stage_already_complete = manager.target_real_groups_complete
+                step_metadata = self._build_slot_metadata(
+                    rollout_epoch_id=0,
+                    stage_id=stage_id,
+                )
+
+                rollout_result = self.recv_from(
+                    group_name=self.cfg.rollout.group_name,
+                    channel=input_channel,
+                    tag="train_rollout_results",
+                    route_key=stage_id if not self.env_decoupled_mode else None,
+                    batch_size=self.train_batch_size,
+                    merge_fn=RolloutResult.merge_rollout_results,
+                    infer_batch_size_fn=self._infer_rollout_batch_size,
+                    decoupled_mode=self.env_decoupled_mode,
+                )
+
+                env_output, env_info = self.env_interact_step(
+                    rollout_result.actions, stage_id
+                )
+
+                reward_model_output = None
+                if reward_channel is not None and not stage_already_complete:
+                    reward_model_output = self.get_reward_model_output(
+                        env_output,
+                        send_channel=reward_channel,
+                        recv_channel=input_channel,
+                        stage_id=stage_id,
+                    )
+                    if reward_model_output is not None:
+                        env_metrics["reward_model_output"].append(
+                            reward_model_output.detach().float().reshape(-1).cpu()
+                        )
+
+                if not stage_already_complete:
+                    rewards = self.compute_bootstrap_rewards(
+                        env_output,
+                        bootstrap_values=None,
+                        reward_model_output=reward_model_output,
+                    )
+                    self._append_continuous_step_result(
+                        stage_id=stage_id,
+                        rollout_result=rollout_result,
+                        env_output=env_output,
+                        rewards=rewards,
+                        slot_metadata=step_metadata,
+                    )
+                    if (
+                        self.reward_mode == "history_buffer"
+                        and self.history_reward_assign
+                        and reward_model_output is not None
+                    ):
+                        self.assign_history_reward(stage_id, reward_model_output)
+
+                newly_done = self._mark_slot_managers_done(
+                    stage_id=stage_id, dones=env_output.dones
+                )
+                reassignment = self._reassign_done_slots(
+                    stage_id=stage_id,
+                    newly_done=newly_done,
+                    allow_real_groups=not manager.target_real_groups_complete,
+                )
+                reset_obs = self._reset_reassigned_env_slots(
+                    stage_id=stage_id, reassignment=reassignment
+                )
+                if reset_obs is not None:
+                    env_output.obs = reset_obs
+                    self._append_continuous_initial_boundary(
+                        stage_id=stage_id,
+                        slot_indices=reassignment["slot_indices"],
+                    )
+
+                if env_info:
+                    self.record_env_metrics(env_metrics, env_info)
+
+                next_env_outputs[stage_id] = env_output
+
+            env_outputs = next_env_outputs
+            chunk_step_idx += 1
+            for stage_id, env_output in enumerate(env_outputs):
+                if stopped_stages[stage_id]:
+                    continue
+                manager = self.slot_state_managers[stage_id]
+                if manager.target_real_groups_complete:
+                    self._send_train_env_output(
+                        rollout_channel,
+                        stage_id,
+                        env_output,
+                        continuous_done=True,
+                    )
+                    stopped_stages[stage_id] = True
+                else:
+                    self._send_train_env_output(rollout_channel, stage_id, env_output)
+
+        if not self._continuous_targets_complete():
+            raise RuntimeError(
+                "continuous_batching did not complete target groups within "
+                f"{max_chunk_steps} chunks. Completed per stage: "
+                f"{[m.completed_real_group_count for m in self.slot_state_managers]}, "
+                f"target={target_groups_per_stage}."
+            )
+        self.store_last_obs_and_intervened_info(env_outputs)
+        self.finish_rollout()
+
+        if actor_channel is not None:
+            for stage_id in range(self.stage_num):
+                await self.send_rollout_trajectories(
+                    self.rollout_results[stage_id], actor_channel
+                )
+            self.rollout_results = []
+            gc.collect()
+
+        for key, value in env_metrics.items():
+            env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+
+        return env_metrics
+
     @Worker.timer("env/send_rollout_trajectories")
     async def send_rollout_trajectories(
         self, rollout_result: EmbodiedRolloutResult, channel: Channel
@@ -1017,6 +1762,15 @@ class EnvWorker(Worker):
         *,
         cooperative_yield: bool,
     ) -> dict[str, torch.Tensor]:
+        if self.continuous_batching_enabled:
+            return await self._run_interact_once_continuous(
+                input_channel,
+                rollout_channel,
+                reward_channel,
+                actor_channel,
+                cooperative_yield=cooperative_yield,
+            )
+
         self.rollout_results = [
             self._new_rollout_collector() for _ in range(self.stage_num)
         ]
@@ -1024,18 +1778,12 @@ class EnvWorker(Worker):
         rlt_pending_obs: list[dict[str, Any] | None] = [None] * self.stage_num
 
         for epoch in range(self.rollout_epoch):
-            active_slot_masks = None
-            if self.continuous_batching_enabled:
-                active_slot_masks = [
-                    torch.ones(self.train_num_envs_per_stage, dtype=torch.bool)
-                    for _ in range(self.stage_num)
-                ]
-
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
             else:
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
+            self._ensure_slot_state_managers()
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
@@ -1077,11 +1825,10 @@ class EnvWorker(Worker):
                         env_output, rollout_result.bootstrap_values, reward_model_output
                     )
                     slot_metadata = {}
-                    if self.continuous_batching_enabled:
+                    if self.collect_slot_metadata:
                         slot_metadata = self._build_slot_metadata(
                             rollout_epoch_id=epoch,
                             stage_id=stage_id,
-                            is_active=active_slot_masks[stage_id],
                         )
                     chunk_step_result = ChunkStepResult(
                         actions=rollout_result.forward_inputs.get("action", None),
@@ -1126,10 +1873,18 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
-                    if self.continuous_batching_enabled:
-                        active_slot_masks[stage_id] = self._update_active_slots(
-                            active_slot_masks[stage_id], env_output.dones
+                    if self.collect_slot_metadata:
+                        newly_done = self._mark_slot_managers_done(
+                            stage_id=stage_id, dones=env_output.dones
                         )
+                        reassignment = self._reassign_done_slots(
+                            stage_id=stage_id, newly_done=newly_done
+                        )
+                        reset_obs = self._reset_reassigned_env_slots(
+                            stage_id=stage_id, reassignment=reassignment
+                        )
+                        if reset_obs is not None:
+                            env_output.obs = reset_obs
                     env_batch = env_output.to_dict()
                     data = {
                         "obs": env_batch["obs"],
@@ -1202,11 +1957,10 @@ class EnvWorker(Worker):
                     env_output, rollout_result.bootstrap_values, reward_model_output
                 )
                 slot_metadata = {}
-                if self.continuous_batching_enabled:
+                if self.collect_slot_metadata:
                     slot_metadata = self._build_slot_metadata(
                         rollout_epoch_id=epoch,
                         stage_id=stage_id,
-                        is_active=active_slot_masks[stage_id],
                     )
                 chunk_step_result = ChunkStepResult(
                     prev_values=(

@@ -838,7 +838,7 @@ class ContinuousBatchingRolloutCollector:
     def __init__(self, max_episode_length: int = 0):
         self.max_episode_length = max_episode_length
         self._buffers: dict[tuple[int, int], EmbodiedRolloutResult] = {}
-        self._slot_keys: list[tuple[int, int]] = []
+        self._slot_keys: list[tuple[int, int] | None] = []
         self._key_to_epoch_slot: dict[tuple[int, int], tuple[int, int]] = {}
         self.group_to_trajectory_keys: dict[int, set[tuple[int, int]]] = {}
 
@@ -899,6 +899,14 @@ class ContinuousBatchingRolloutCollector:
         slot_id = int(slot_metadata["slot_id"][slot_idx].reshape(-1)[0].item())
         return rollout_epoch_id, slot_id
 
+    @staticmethod
+    def _metadata_is_dummy(
+        slot_metadata: dict[str, torch.Tensor], slot_idx: int
+    ) -> bool:
+        if "is_dummy" not in slot_metadata:
+            return False
+        return bool(slot_metadata["is_dummy"][slot_idx].reshape(-1)[0].item())
+
     def _get_buffer(
         self, key: tuple[int, int], epoch_slot: tuple[int, int] | None = None
     ) -> EmbodiedRolloutResult:
@@ -925,6 +933,9 @@ class ContinuousBatchingRolloutCollector:
         batch_size = self._infer_batch_size(result)
         self._slot_keys = []
         for slot_idx in range(batch_size):
+            if self._metadata_is_dummy(result.slot_metadata, slot_idx):
+                self._slot_keys.append(None)
+                continue
             key = self._metadata_key(result.slot_metadata, slot_idx)
             epoch_slot = self._metadata_epoch_slot(result.slot_metadata, slot_idx)
             self._slot_keys.append(key)
@@ -950,6 +961,8 @@ class ContinuousBatchingRolloutCollector:
         if not self._slot_keys:
             return
         for slot_idx, key in enumerate(self._slot_keys):
+            if key is None:
+                continue
             self._get_buffer(key).mark_last_step_with_flags(
                 save_flags[slot_idx : slot_idx + 1]
             )
@@ -960,6 +973,8 @@ class ContinuousBatchingRolloutCollector:
         if not self._slot_keys:
             return
         for slot_idx, key in enumerate(self._slot_keys):
+            if key is None:
+                continue
             self._get_buffer(key).update_last_actions(
                 intervene_actions[slot_idx : slot_idx + 1],
                 intervene_flags[slot_idx : slot_idx + 1],
@@ -972,6 +987,8 @@ class ContinuousBatchingRolloutCollector:
                 "Cannot append transitions before appending a slot-metadata step."
             )
         for slot_idx, key in enumerate(self._slot_keys):
+            if key is None:
+                continue
             self._get_buffer(key).append_transitions(
                 self._slice_batch_value(curr_obs, slot_idx),
                 self._slice_batch_value(next_obs, slot_idx),

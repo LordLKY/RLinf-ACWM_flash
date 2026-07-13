@@ -1529,9 +1529,14 @@ class ContinuousBatchingWanEnv(WanEnv):
             chunk_rewards_tensors.sum(dim=1), past_terminations, {}
         )
         if past_dones.any() and self.auto_reset:
-            extracted_obs, infos = self._handle_auto_reset(
-                past_dones, extracted_obs, infos
-            )
+            final_info = infos
+            infos = {
+                "final_observation": extracted_obs,
+                "final_info": final_info,
+                "_final_info": past_dones,
+                "_final_observation": past_dones,
+                "_elapsed_steps": past_dones,
+            }
 
         chunk_terminations = torch.zeros_like(raw_chunk_terminations)
         chunk_terminations[:, -1] = past_terminations
