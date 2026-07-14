@@ -1004,12 +1004,17 @@ class EnvWorker(Worker):
         )
 
     def _new_rollout_collector(self):
-        collector_cls = (
-            ContinuousBatchingRolloutCollector
-            if self.continuous_batching_enabled
-            else EmbodiedRolloutResult
+        if self.continuous_batching_enabled:
+            return ContinuousBatchingRolloutCollector(
+                max_episode_length=self.cfg.env.train.max_episode_steps,
+                group_size=int(self.cfg.algorithm.group_size),
+                batch_size=self.train_num_envs_per_stage,
+                rollout_epoch=self.rollout_epoch,
+                target_chunk_steps=self.n_train_chunk_steps,
+            )
+        return EmbodiedRolloutResult(
+            max_episode_length=self.cfg.env.train.max_episode_steps
         )
-        return collector_cls(max_episode_length=self.cfg.env.train.max_episode_steps)
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int

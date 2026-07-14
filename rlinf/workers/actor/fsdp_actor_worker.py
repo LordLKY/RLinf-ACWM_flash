@@ -1167,7 +1167,11 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_epoch = self.cfg.env.train.rollout_epoch
         rollout_batch = process_nested_dict_for_adv(rollout_batch, rollout_epoch)
 
-        if (
+        continuous_batching_cfg = self.cfg.env.train.get("continuous_batching", {})
+        continuous_batching_enabled = bool(
+            continuous_batching_cfg.get("enabled", False)
+        )
+        if continuous_batching_enabled or (
             not self.cfg.env.train.auto_reset
             and not self.cfg.env.train.ignore_terminations
         ):

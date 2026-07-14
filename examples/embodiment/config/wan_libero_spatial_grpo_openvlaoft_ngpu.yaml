@@ -21,7 +21,7 @@ profile:
   profile_rollout: True
 
 continuous_batching:
-  enabled: False
+  enabled: True
 
 cluster:
   num_nodes: 1

@@ -835,12 +835,32 @@ class ContinuousBatchingRolloutCollector:
     legacy time-major ``Trajectory`` format: [T, B, ...].
     """
 
-    def __init__(self, max_episode_length: int = 0):
+    def __init__(
+        self,
+        max_episode_length: int = 0,
+        *,
+        group_size: int | None = None,
+        batch_size: int | None = None,
+        rollout_epoch: int = 1,
+        target_chunk_steps: int | None = None,
+    ):
         self.max_episode_length = max_episode_length
+        self.group_size = group_size
+        self.batch_size = batch_size
+        self.rollout_epoch = int(rollout_epoch)
+        self.target_chunk_steps = target_chunk_steps
         self._buffers: dict[tuple[int, int], EmbodiedRolloutResult] = {}
         self._slot_keys: list[tuple[int, int] | None] = []
         self._key_to_epoch_slot: dict[tuple[int, int], tuple[int, int]] = {}
         self.group_to_trajectory_keys: dict[int, set[tuple[int, int]]] = {}
+
+    @property
+    def _fixed_shape_export_enabled(self) -> bool:
+        return (
+            self.group_size is not None
+            and self.batch_size is not None
+            and self.target_chunk_steps is not None
+        )
 
     @staticmethod
     def _slice_batch_value(value: Any, slot_idx: int) -> Any:
@@ -1048,8 +1068,291 @@ class ContinuousBatchingRolloutCollector:
             epoch_batches.append(convert_trajectories_to_batch(trajectories))
         return epoch_batches
 
+    @staticmethod
+    def _pad_tensor_time_dim(
+        tensor: torch.Tensor,
+        target_len: int,
+        *,
+        repeat_last: bool = False,
+        fill_value: bool | int | float = 0,
+    ) -> torch.Tensor:
+        current_len = int(tensor.shape[0])
+        if current_len > target_len:
+            raise ValueError(
+                f"Cannot pad tensor with time length {current_len} to shorter "
+                f"target length {target_len}."
+            )
+        if current_len == target_len:
+            return tensor.cpu().contiguous()
+
+        pad_len = target_len - current_len
+        if repeat_last:
+            if current_len <= 0:
+                raise ValueError("Cannot repeat-pad an empty time dimension.")
+            pad = tensor[-1:].expand(pad_len, *tensor.shape[1:]).clone()
+        else:
+            pad = torch.full(
+                (pad_len, *tensor.shape[1:]),
+                fill_value,
+                dtype=tensor.dtype,
+                device=tensor.device,
+            )
+        return torch.cat([tensor, pad], dim=0).cpu().contiguous()
+
+    @classmethod
+    def _pad_nested_time_dim(
+        cls,
+        data: dict[str, Any],
+        target_len: int,
+        *,
+        repeat_last: bool = False,
+    ) -> dict[str, Any]:
+        padded = {}
+        for key, value in data.items():
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                padded[key] = cls._pad_tensor_time_dim(
+                    value,
+                    target_len,
+                    repeat_last=repeat_last,
+                )
+            elif isinstance(value, dict):
+                padded[key] = cls._pad_nested_time_dim(
+                    value,
+                    target_len,
+                    repeat_last=repeat_last,
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported nested value type while padding: {type(value)}"
+                )
+        return padded
+
+    @staticmethod
+    def _trim_slot_metadata_to_actions(
+        slot_metadata: dict[str, Any], action_len: int
+    ) -> dict[str, Any]:
+        trimmed = {}
+        for key, value in slot_metadata.items():
+            if value is None:
+                continue
+            if isinstance(value, torch.Tensor):
+                if int(value.shape[0]) == action_len + 1:
+                    trimmed[key] = value[-action_len:].cpu().contiguous()
+                elif int(value.shape[0]) == action_len:
+                    trimmed[key] = value.cpu().contiguous()
+                elif int(value.shape[0]) > action_len:
+                    trimmed[key] = value[-action_len:].cpu().contiguous()
+                else:
+                    raise ValueError(
+                        f"slot_metadata[{key}] time length {value.shape[0]} is "
+                        f"shorter than action length {action_len}."
+                    )
+            elif isinstance(value, dict):
+                trimmed[key] = ContinuousBatchingRolloutCollector._trim_slot_metadata_to_actions(
+                    value, action_len
+                )
+            else:
+                raise ValueError(
+                    f"Unsupported slot_metadata value type while trimming: {type(value)}"
+                )
+        return trimmed
+
+    @classmethod
+    def _pad_slot_metadata(
+        cls, slot_metadata: dict[str, Any], target_len: int, action_len: int
+    ) -> dict[str, Any]:
+        trimmed = cls._trim_slot_metadata_to_actions(slot_metadata, action_len)
+        padded = cls._pad_nested_time_dim(trimmed, target_len, repeat_last=True)
+        if target_len > action_len:
+            for key, value in padded.items():
+                if not isinstance(value, torch.Tensor):
+                    continue
+                if key == "is_active":
+                    value[action_len:] = False
+                elif key in {"is_done", "group_complete"}:
+                    value[action_len:] = True
+        return padded
+
+    @staticmethod
+    def _trajectory_is_complete(trajectory: Trajectory) -> bool:
+        return (
+            trajectory.dones is not None
+            and trajectory.dones.shape[0] > 0
+            and bool(trajectory.dones[-1].bool().any().item())
+        )
+
+    def _pad_trajectory_to_fixed_chunks(
+        self, trajectory: Trajectory, key: tuple[int, int]
+    ) -> Trajectory:
+        assert self.target_chunk_steps is not None
+        target_len = int(self.target_chunk_steps)
+        action_len = (
+            int(trajectory.actions.shape[0])
+            if isinstance(trajectory.actions, torch.Tensor)
+            else 0
+        )
+        if action_len <= 0:
+            raise ValueError(f"Trajectory {key} has no actions.")
+        if action_len > target_len:
+            raise ValueError(
+                f"Trajectory {key} has {action_len} chunks, exceeding target "
+                f"chunk steps {target_len}."
+            )
+        if not self._trajectory_is_complete(trajectory):
+            raise ValueError(f"Trajectory {key} is not complete.")
+
+        padded = Trajectory(
+            max_episode_length=self.max_episode_length,
+            model_weights_id=trajectory.model_weights_id,
+        )
+        action_fields = (
+            "actions",
+            "intervene_flags",
+            "rewards",
+            "prev_logprobs",
+        )
+        for field_name in action_fields:
+            value = getattr(trajectory, field_name)
+            if isinstance(value, torch.Tensor):
+                setattr(
+                    padded,
+                    field_name,
+                    self._pad_tensor_time_dim(value, target_len),
+                )
+        if isinstance(trajectory.versions, torch.Tensor):
+            padded.versions = self._pad_tensor_time_dim(
+                trajectory.versions,
+                target_len,
+                repeat_last=True,
+            )
+
+        if isinstance(trajectory.prev_values, torch.Tensor):
+            prev_value_target_len = (
+                target_len + 1
+                if int(trajectory.prev_values.shape[0]) == action_len + 1
+                else target_len
+            )
+            padded.prev_values = self._pad_tensor_time_dim(
+                trajectory.prev_values, prev_value_target_len
+            )
+
+        boundary_fields = ("dones", "terminations", "truncations")
+        for field_name in boundary_fields:
+            value = getattr(trajectory, field_name)
+            if not isinstance(value, torch.Tensor):
+                continue
+            expected_len = action_len + 1
+            if int(value.shape[0]) != expected_len:
+                raise ValueError(
+                    f"Trajectory {key} field {field_name} has time length "
+                    f"{value.shape[0]}, expected {expected_len}."
+                )
+            fill_value = field_name == "dones"
+            setattr(
+                padded,
+                field_name,
+                self._pad_tensor_time_dim(
+                    value,
+                    target_len + 1,
+                    fill_value=fill_value,
+                ),
+            )
+
+        if trajectory.forward_inputs:
+            padded.forward_inputs = self._pad_nested_time_dim(
+                trajectory.forward_inputs,
+                target_len,
+                repeat_last=True,
+            )
+        if trajectory.slot_metadata:
+            padded.slot_metadata = self._pad_slot_metadata(
+                trajectory.slot_metadata,
+                target_len,
+                action_len,
+            )
+        if trajectory.curr_obs:
+            padded.curr_obs = self._pad_nested_time_dim(
+                trajectory.curr_obs,
+                target_len,
+                repeat_last=True,
+            )
+        if trajectory.next_obs:
+            padded.next_obs = self._pad_nested_time_dim(
+                trajectory.next_obs,
+                target_len,
+                repeat_last=True,
+            )
+        return padded
+
+    def _ordered_completed_group_keys(self) -> list[tuple[int, int]]:
+        assert self.group_size is not None
+        ordered_keys: list[tuple[int, int]] = []
+        for group_id in sorted(self.group_to_trajectory_keys):
+            group_keys = sorted(
+                self.group_to_trajectory_keys[group_id],
+                key=lambda item: item[1],
+            )
+            if len(group_keys) != self.group_size:
+                raise ValueError(
+                    f"Group {group_id} has {len(group_keys)} trajectories, "
+                    f"expected group_size={self.group_size}."
+                )
+            expected_members = list(range(self.group_size))
+            actual_members = [member_id for _, member_id in group_keys]
+            if actual_members != expected_members:
+                raise ValueError(
+                    f"Group {group_id} has members {actual_members}, "
+                    f"expected {expected_members}."
+                )
+            for key in group_keys:
+                trajectory = self._buffers[key].to_trajectory()
+                if not self._trajectory_is_complete(trajectory):
+                    raise ValueError(f"Trajectory {key} in group {group_id} is incomplete.")
+            ordered_keys.extend(group_keys)
+        return ordered_keys
+
+    def _fixed_shape_epoch_batches(self) -> list[dict[str, Any]]:
+        if not self._buffers:
+            return []
+        assert self.batch_size is not None
+        assert self.group_size is not None
+        if self.batch_size % self.group_size != 0:
+            raise ValueError(
+                f"batch_size={self.batch_size} must be divisible by "
+                f"group_size={self.group_size}."
+            )
+
+        ordered_keys = self._ordered_completed_group_keys()
+        expected_trajectories = self.batch_size * self.rollout_epoch
+        if len(ordered_keys) != expected_trajectories:
+            raise ValueError(
+                f"Continuous batching collected {len(ordered_keys)} complete "
+                f"trajectories, expected {expected_trajectories} "
+                f"({self.batch_size=} * {self.rollout_epoch=})."
+            )
+
+        epoch_batches = []
+        for epoch_idx in range(self.rollout_epoch):
+            begin = epoch_idx * self.batch_size
+            end = begin + self.batch_size
+            epoch_keys = ordered_keys[begin:end]
+            trajectories = [
+                self._pad_trajectory_to_fixed_chunks(
+                    self._buffers[key].to_trajectory(), key
+                )
+                for key in epoch_keys
+            ]
+            epoch_batches.append(convert_trajectories_to_batch(trajectories))
+        return epoch_batches
+
     def to_trajectory(self) -> Trajectory:
-        epoch_batches = self._epoch_batches()
+        epoch_batches = (
+            self._fixed_shape_epoch_batches()
+            if self._fixed_shape_export_enabled
+            else self._epoch_batches()
+        )
         if not epoch_batches:
             return Trajectory(max_episode_length=self.max_episode_length)
 
