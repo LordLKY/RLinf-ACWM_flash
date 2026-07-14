@@ -397,15 +397,15 @@ class EnvSlotStateManager:
         )
 
         return {
-            "slot_id": self.slot_ids.reshape(self.num_slots, 1),
-            "trajectory_id": self.trajectory_ids.reshape(self.num_slots, 1),
-            "group_id": self.group_ids.reshape(self.num_slots, 1),
-            "group_member_id": self.group_member_ids.reshape(self.num_slots, 1),
-            "reset_state_id": self.reset_state_ids.reshape(self.num_slots, 1),
-            "rollout_epoch_id": self.assignment_rounds.reshape(self.num_slots, 1),
-            "assignment_round": self.assignment_rounds.reshape(self.num_slots, 1),
-            "is_active": self.active.reshape(self.num_slots, 1),
-            "is_done": self.done.reshape(self.num_slots, 1),
+            "slot_id": self.slot_ids.reshape(self.num_slots, 1).clone(),
+            "trajectory_id": self.trajectory_ids.reshape(self.num_slots, 1).clone(),
+            "group_id": self.group_ids.reshape(self.num_slots, 1).clone(),
+            "group_member_id": self.group_member_ids.reshape(self.num_slots, 1).clone(),
+            "reset_state_id": self.reset_state_ids.reshape(self.num_slots, 1).clone(),
+            "rollout_epoch_id": self.assignment_rounds.reshape(self.num_slots, 1).clone(),
+            "assignment_round": self.assignment_rounds.reshape(self.num_slots, 1).clone(),
+            "is_active": self.active.reshape(self.num_slots, 1).clone(),
+            "is_done": self.done.reshape(self.num_slots, 1).clone(),
             "is_dummy": is_dummy.reshape(self.num_slots, 1),
             "group_complete": group_complete.reshape(self.num_slots, 1),
             "group_completed_member_count": group_completed_member_count.reshape(

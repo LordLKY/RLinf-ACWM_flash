@@ -867,7 +867,7 @@ class ContinuousBatchingRolloutCollector:
         if value is None:
             return None
         if isinstance(value, torch.Tensor):
-            return value[slot_idx : slot_idx + 1].contiguous()
+            return value[slot_idx : slot_idx + 1].clone().contiguous()
         if isinstance(value, dict):
             return {
                 key: ContinuousBatchingRolloutCollector._slice_batch_value(

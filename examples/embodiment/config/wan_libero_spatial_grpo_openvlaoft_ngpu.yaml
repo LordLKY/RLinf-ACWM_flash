@@ -15,18 +15,18 @@ hydra:
 
 # Number of GPUs to use. The default reproduces wan_libero_spatial_grpo_openvlaoft.
 # Override with e.g. `n_gpu=4`.
-n_gpu: 1
+n_gpu: 2
 
 profile:
   profile_rollout: True
 
 continuous_batching:
-  enabled: False
+  enabled: True
 
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 7-7  # 0-${subtract:${n_gpu},1}  # for test
+    actor,env,rollout: 6-7  # 0-${subtract:${n_gpu},1}  # for test
 
 runner:
   task_type: embodied
@@ -41,7 +41,7 @@ runner:
 
   only_eval: False
   val_check_interval: -1
-  save_interval: 5
+  save_interval: -1  # 5  # for test
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
