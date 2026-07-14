@@ -750,7 +750,9 @@ class MultiStepRolloutWorker(Worker):
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
                 ).async_wait()
-                continuous_done = bool(env_output.get("continuous_done", False))
+                continuous_done = self._is_continuous_done(
+                    env_output.get("continuous_done", False)
+                )
                 if continuous_done:
                     stopped_stages[stage_id] = True
                     continue
@@ -919,6 +921,18 @@ class MultiStepRolloutWorker(Worker):
         raise ValueError("Cannot infer batch size from env obs.")
 
     @staticmethod
+    def _is_continuous_done(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, torch.Tensor):
+            return bool(value.bool().all().item())
+        if isinstance(value, np.ndarray):
+            return bool(value.astype(bool).all())
+        if isinstance(value, list):
+            return all(bool(item) for item in value)
+        return bool(value)
+
+    @staticmethod
     def _merge_obs_batches(obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
         if not obs_batches:
             return {}
@@ -931,7 +945,10 @@ class MultiStepRolloutWorker(Worker):
             obs_batch.get("rlt_switch_flags", None) for obs_batch in obs_batches
         ]
         continuous_done_flags = [
-            bool(obs_batch.get("continuous_done", False)) for obs_batch in obs_batches
+            MultiStepRolloutWorker._is_continuous_done(
+                obs_batch.get("continuous_done", False)
+            )
+            for obs_batch in obs_batches
         ]
         if any(continuous_done_flags) and not all(continuous_done_flags):
             raise RuntimeError(

@@ -1293,6 +1293,10 @@ class ContinuousBatchingWanEnv(WanEnv):
 
         self.current_obs = self.slot_obs_histories
         self.condition_action = self.condition_action.to(self.device)
+        condition_action = condition_action.to(
+            device=self.condition_action.device,
+            dtype=self.condition_action.dtype,
+        )
         self.condition_action[slot_device] = condition_action
         self.reset_state_ids = self.reset_state_ids.to(self.device)
         self.reset_state_ids[slot_device] = torch.as_tensor(

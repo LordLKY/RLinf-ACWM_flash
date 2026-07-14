@@ -21,12 +21,12 @@ profile:
   profile_rollout: True
 
 continuous_batching:
-  enabled: True
+  enabled: False
 
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-${subtract:${n_gpu},1}
+    actor,env,rollout: 7-7  # 0-${subtract:${n_gpu},1}  # for test
 
 runner:
   task_type: embodied

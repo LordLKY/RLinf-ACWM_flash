@@ -1428,7 +1428,11 @@ class EnvWorker(Worker):
             "final_obs": env_batch["final_obs"],
         }
         if continuous_done:
-            data["continuous_done"] = True
+            from rlinf.scheduler import infer_batch_size
+
+            data["continuous_done"] = torch.ones(
+                (infer_batch_size(env_batch["obs"]),), dtype=torch.bool
+            )
         if self.enable_rlt:
             data["rlt_switch_flags"] = env_batch.get("rlt_switch_flags", None)
         self.send_to(
@@ -1541,8 +1545,17 @@ class EnvWorker(Worker):
         rewards: torch.Tensor | None,
         slot_metadata: dict[str, torch.Tensor],
     ) -> None:
+        actions = rollout_result.forward_inputs.get("action", rollout_result.actions)
+        action_tokens = rollout_result.forward_inputs.get("action_tokens", None)
+        if actions is not None and action_tokens is not None:
+            if actions.shape[:2] != action_tokens.shape[:2]:
+                raise ValueError(
+                    "continuous_batching action/action_tokens length mismatch: "
+                    f"actions.shape={tuple(actions.shape)}, "
+                    f"action_tokens.shape={tuple(action_tokens.shape)}."
+                )
         chunk_step_result = ChunkStepResult(
-            actions=rollout_result.forward_inputs.get("action", None),
+            actions=actions,
             prev_logprobs=(
                 rollout_result.prev_logprobs if self.collect_prev_infos else None
             ),
