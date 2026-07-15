@@ -1,0 +1,50 @@
+defaults:
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+data:
+  root: /mnt/kyliu/code/RLinf/logs/20260714-13:35:39-wan_libero_spatial_grpo_openvlaoft_ngpu/profile_early_stop
+  val_ratio: 0.1
+  prefix_mode: list
+  prefix_steps: 64
+  min_prefix_steps: 16
+  max_prefix_steps: 128
+  prefix_step_list: [64, 128]
+  deduplicate_action_file: true
+  discard_duplicate_action_files: true
+  label_source: pt_success
+  num_workers: 4
+
+train:
+  run_name: null
+  batch_size: 64
+  epochs: 1000
+  eval_interval: 5
+  checkpoint_interval: 50
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  seed: 42
+  device: cuda
+  output_dir: /mnt/kyliu/code/RLinf/outputs/early_stop_model/outputs
+  use_pos_weight: true
+  tensorboard: true
+
+model:
+  model_type: early_stop_model
+  action_dim: 7
+  hidden_dim: 32
+  traj_tcn_layers: 2
+  group_tcn_layers: 2
+  traj_kernel_size: 5
+  group_kernel_size: 3
+  dropout: 0.1
+  action_processor_type: group_rms_delta
+  action_norm:
+    eps: 1.0e-6
+    clamp: 5.0
+    include_scale_features: true
