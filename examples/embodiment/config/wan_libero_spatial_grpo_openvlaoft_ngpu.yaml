@@ -18,10 +18,11 @@ hydra:
 n_gpu: 2
 
 profile:
-  profile_rollout: True
+  profile_rollout: False
+  profile_early_stop: True
 
 continuous_batching:
-  enabled: True
+  enabled: False
 
 cluster:
   num_nodes: 1
@@ -36,7 +37,7 @@ runner:
     experiment_name: "wan_libero_spatial_grpo_openvlaoft_ngpu"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 2  # for test
+  max_epochs: 32  # for test
   max_steps: -1
 
   only_eval: False
@@ -82,7 +83,7 @@ env:
   # - train envs per GPU: 64 / 8 = 8
   # - eval envs per GPU: 496 / 8 = 62
   train:
-    rollout_epoch: 8  # 16  # for test
+    rollout_epoch: 16  # 16  # for test
     total_num_envs: ${multiply:8,${n_gpu}}
     group_size: ${algorithm.group_size}
     max_episode_steps: 256 # max episode steps for truncation

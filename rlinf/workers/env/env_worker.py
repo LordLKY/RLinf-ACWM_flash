@@ -14,6 +14,8 @@
 
 import asyncio
 import gc
+import json
+import os
 from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Any
@@ -482,6 +484,18 @@ class EnvWorker(Worker):
         )
         self.collect_slot_metadata = self.continuous_batching_enabled
         self.slot_state_managers: list[EnvSlotStateManager] | None = None
+
+        profile_cfg = self.cfg.get("profile", {})
+        self.profile_early_stop_enabled = bool(
+            profile_cfg.get("profile_early_stop", False)
+        )
+        self._profile_early_stop_groups: dict[tuple[int, int, int, int], dict] = {}
+        self._profile_early_stop_history: list[dict[str, Any]] = []
+        self._profile_early_stop_step_id = 0
+        self._profile_early_stop_dir = os.path.join(
+            str(OmegaConf.select(self.cfg, "runner.logger.log_path", default=".")),
+            "profile_early_stop",
+        )
 
         self.train_enable_offload = (
             train_env_cfg.get("enable_offload", False)
@@ -1015,6 +1029,324 @@ class EnvWorker(Worker):
         return EmbodiedRolloutResult(
             max_episode_length=self.cfg.env.train.max_episode_steps
         )
+
+    def _profile_early_stop_active(self) -> bool:
+        return self.profile_early_stop_enabled and not self.continuous_batching_enabled
+
+    def _profile_early_stop_ensure_dir(self) -> None:
+        os.makedirs(os.path.join(self._profile_early_stop_dir, "groups"), exist_ok=True)
+
+    def _profile_early_stop_group_key(
+        self, *, rollout_epoch_id: int, stage_id: int, slot_idx: int
+    ) -> tuple[int, int, int, int]:
+        group_size = int(self.cfg.algorithm.group_size)
+        groups_per_epoch = int(self.cfg.env.train.total_num_envs // group_size)
+        global_slot_offset = (
+            self._rank * self.train_batch_size
+            + stage_id * self.train_num_envs_per_stage
+        )
+        global_slot_id = int(global_slot_offset + slot_idx)
+        group_id = rollout_epoch_id * groups_per_epoch + global_slot_id // group_size
+        return self._profile_early_stop_step_id, rollout_epoch_id, stage_id, group_id
+
+    def _profile_early_stop_member_id(self, *, stage_id: int, slot_idx: int) -> int:
+        group_size = int(self.cfg.algorithm.group_size)
+        global_slot_offset = (
+            self._rank * self.train_batch_size
+            + stage_id * self.train_num_envs_per_stage
+        )
+        return int((global_slot_offset + slot_idx) % group_size)
+
+    def _profile_early_stop_actions(
+        self, actions: torch.Tensor | None, env_output: EnvOutput
+    ) -> torch.Tensor | None:
+        if actions is None:
+            return None
+        raw_actions = actions.detach().cpu().float().contiguous()
+        if raw_actions.dim() == 2:
+            raw_actions = raw_actions.reshape(
+                raw_actions.shape[0], int(self.model_cfg.num_action_chunks), -1
+            )
+        if raw_actions.dim() != 3:
+            raise ValueError(
+                f"profile_early_stop expects actions with 2 or 3 dims, got "
+                f"{tuple(raw_actions.shape)}."
+            )
+
+        prepared_actions = prepare_actions(
+            raw_chunk_actions=raw_actions,
+            env_type=self.cfg.env.train.env_type,
+            model_type=self.model_cfg.model_type,
+            num_action_chunks=self.model_cfg.num_action_chunks,
+            action_dim=self.model_cfg.action_dim,
+            policy=self.model_cfg.get("policy_setup", None),
+            wm_env_type=self.cfg.env.train.get("wm_env_type", None),
+        )
+        if isinstance(prepared_actions, np.ndarray):
+            prepared_actions = torch.from_numpy(prepared_actions)
+        prepared_actions = prepared_actions.detach().cpu().float().contiguous()
+
+        if env_output.intervene_actions is not None:
+            intervene_actions = env_output.intervene_actions.detach().cpu().float()
+            if intervene_actions.dim() == 2:
+                intervene_actions = intervene_actions.reshape(
+                    prepared_actions.shape[0], prepared_actions.shape[1], -1
+                )
+            intervene_flags = env_output.intervene_flags
+            if intervene_flags is not None:
+                intervene_flags = intervene_flags.detach().cpu().bool()
+                if intervene_flags.dim() == 1:
+                    intervene_flags = intervene_flags[:, None]
+                intervene_flags = intervene_flags.reshape(
+                    prepared_actions.shape[0], prepared_actions.shape[1], 1
+                )
+                prepared_actions = torch.where(
+                    intervene_flags.expand_as(prepared_actions),
+                    intervene_actions.to(prepared_actions.dtype),
+                    prepared_actions,
+                )
+        return prepared_actions
+
+    @staticmethod
+    def _profile_early_stop_bool_matrix(
+        value: torch.Tensor | None, batch_size: int, chunk_size: int
+    ) -> torch.Tensor:
+        if value is None:
+            return torch.zeros((batch_size, chunk_size), dtype=torch.bool)
+        value = value.detach().cpu().bool()
+        if value.dim() == 1:
+            value = value[:, None]
+        if value.shape[0] != batch_size:
+            raise ValueError(
+                f"profile_early_stop expected batch size {batch_size}, "
+                f"got {value.shape[0]}."
+            )
+        if value.shape[1] != chunk_size:
+            if value.shape[1] == 1:
+                padded = torch.zeros((batch_size, chunk_size), dtype=torch.bool)
+                padded[:, -1:] = value
+                value = padded
+            else:
+                raise ValueError(
+                    f"profile_early_stop expected chunk size {chunk_size}, "
+                    f"got {value.shape[1]}."
+                )
+        return value
+
+    def _profile_early_stop_new_group(
+        self, *, key: tuple[int, int, int, int], action_dim: int
+    ) -> dict[str, Any]:
+        step_id, rollout_epoch_id, stage_id, group_id = key
+        group_size = int(self.cfg.algorithm.group_size)
+        max_episode_steps = int(self.cfg.env.train.max_episode_steps)
+        return {
+            "metadata": {
+                "global_step": step_id,
+                "rollout_epoch_id": rollout_epoch_id,
+                "rank": self._rank,
+                "stage_id": stage_id,
+                "group_id": group_id,
+                "group_size": group_size,
+                "max_episode_steps": max_episode_steps,
+                "num_action_chunks": int(self.model_cfg.num_action_chunks),
+                "action_dim": int(action_dim),
+            },
+            "actions": torch.zeros(
+                (group_size, max_episode_steps, action_dim), dtype=torch.float32
+            ),
+            "lengths": torch.zeros(group_size, dtype=torch.long),
+            "done_steps": torch.full((group_size,), -1, dtype=torch.long),
+            "success": torch.zeros(group_size, dtype=torch.bool),
+            "failure": torch.zeros(group_size, dtype=torch.bool),
+            "done": torch.zeros(group_size, dtype=torch.bool),
+        }
+
+    def _profile_early_stop_write_group(
+        self, key: tuple[int, int, int, int], group: dict[str, Any]
+    ) -> None:
+        self._profile_early_stop_ensure_dir()
+        metadata = dict(group["metadata"])
+        success = group["success"].cpu().bool()
+        failure = group["failure"].cpu().bool()
+        done = group["done"].cpu().bool()
+        lengths = group["lengths"].cpu().long()
+        done_steps = group["done_steps"].cpu().long()
+        group_filename = (
+            f"step{metadata['global_step']:06d}_"
+            f"epoch{metadata['rollout_epoch_id']:03d}_"
+            f"rank{metadata['rank']:03d}_"
+            f"stage{metadata['stage_id']:02d}_"
+            f"group{metadata['group_id']:06d}.pt"
+        )
+        group_path = os.path.join(
+            self._profile_early_stop_dir, "groups", group_filename
+        )
+        torch.save(
+            {
+                "metadata": metadata,
+                "actions": group["actions"].cpu().contiguous(),
+                "lengths": lengths,
+                "done_steps": done_steps,
+                "success": success,
+                "failure": failure,
+                "done": done,
+            },
+            group_path,
+        )
+
+        record = {
+            **metadata,
+            "action_file": os.path.relpath(group_path, self._profile_early_stop_dir),
+            "success": [bool(x) for x in success.tolist()],
+            "failure": [bool(x) for x in failure.tolist()],
+            "done": [bool(x) for x in done.tolist()],
+            "lengths": [int(x) for x in lengths.tolist()],
+            "done_steps": [int(x) for x in done_steps.tolist()],
+            "success_count": int(success.sum().item()),
+            "failure_count": int(failure.sum().item()),
+            "all_failed": bool(success.sum().item() == 0),
+        }
+        self._profile_early_stop_history.append(record)
+        with open(
+            os.path.join(
+                self._profile_early_stop_dir,
+                f"groups_env_rank{self._rank}.jsonl",
+            ),
+            "a",
+            encoding="utf-8",
+        ) as f:
+            f.write(json.dumps(record) + "\n")
+
+    def _profile_early_stop_record_chunk(
+        self,
+        *,
+        rollout_epoch_id: int,
+        stage_id: int,
+        actions: torch.Tensor | None,
+        env_output: EnvOutput,
+    ) -> None:
+        if not self._profile_early_stop_active():
+            return
+        prepared_actions = self._profile_early_stop_actions(actions, env_output)
+        if prepared_actions is None:
+            return
+
+        batch_size, chunk_size, action_dim = prepared_actions.shape
+        terminations = self._profile_early_stop_bool_matrix(
+            env_output.terminations, batch_size, chunk_size
+        )
+        truncations = self._profile_early_stop_bool_matrix(
+            env_output.truncations, batch_size, chunk_size
+        )
+        dones = terminations | truncations
+        max_episode_steps = int(self.cfg.env.train.max_episode_steps)
+
+        for slot_idx in range(batch_size):
+            key = self._profile_early_stop_group_key(
+                rollout_epoch_id=rollout_epoch_id,
+                stage_id=stage_id,
+                slot_idx=slot_idx,
+            )
+            member_id = self._profile_early_stop_member_id(
+                stage_id=stage_id, slot_idx=slot_idx
+            )
+            group = self._profile_early_stop_groups.get(key)
+            if group is None:
+                group = self._profile_early_stop_new_group(
+                    key=key, action_dim=action_dim
+                )
+                self._profile_early_stop_groups[key] = group
+
+            if bool(group["done"][member_id].item()):
+                continue
+
+            start = int(group["lengths"][member_id].item())
+            if start >= max_episode_steps:
+                group["done"][member_id] = True
+                group["failure"][member_id] = True
+                group["done_steps"][member_id] = max_episode_steps
+                continue
+
+            remaining = max_episode_steps - start
+            copy_len = min(chunk_size, remaining)
+            done_positions = torch.nonzero(
+                dones[slot_idx, :copy_len], as_tuple=False
+            ).flatten()
+            if done_positions.numel() > 0:
+                copy_len = int(done_positions[0].item()) + 1
+
+            if copy_len > 0:
+                group["actions"][member_id, start : start + copy_len] = (
+                    prepared_actions[slot_idx, :copy_len]
+                )
+                group["lengths"][member_id] = start + copy_len
+
+            if done_positions.numel() > 0:
+                done_idx = int(done_positions[0].item())
+                succeeded = bool(terminations[slot_idx, done_idx].item())
+                group["done"][member_id] = True
+                group["success"][member_id] = succeeded
+                group["failure"][member_id] = not succeeded
+                group["done_steps"][member_id] = int(group["lengths"][member_id].item())
+            elif int(group["lengths"][member_id].item()) >= max_episode_steps:
+                group["done"][member_id] = True
+                group["failure"][member_id] = True
+                group["done_steps"][member_id] = max_episode_steps
+
+            if bool(group["done"].all().item()):
+                self._profile_early_stop_write_group(key, group)
+                del self._profile_early_stop_groups[key]
+
+    def finalize_profile_early_stop(self) -> dict[str, Any]:
+        if not self.profile_early_stop_enabled or self.continuous_batching_enabled:
+            return {}
+        self._profile_early_stop_ensure_dir()
+        for key, group in list(self._profile_early_stop_groups.items()):
+            not_done = ~group["done"]
+            group["failure"][not_done] = True
+            group["done_steps"][not_done] = group["lengths"][not_done]
+            self._profile_early_stop_write_group(key, group)
+            del self._profile_early_stop_groups[key]
+
+        total_groups = len(self._profile_early_stop_history)
+        total_trajectories = sum(
+            int(record["group_size"]) for record in self._profile_early_stop_history
+        )
+        success_trajectories = sum(
+            int(record["success_count"]) for record in self._profile_early_stop_history
+        )
+        failure_trajectories = sum(
+            int(record["failure_count"]) for record in self._profile_early_stop_history
+        )
+        all_failed_groups = sum(
+            1 for record in self._profile_early_stop_history if record["all_failed"]
+        )
+        summary = {
+            "rank": self._rank,
+            "total_groups": total_groups,
+            "total_trajectories": total_trajectories,
+            "success_trajectories": success_trajectories,
+            "failure_trajectories": failure_trajectories,
+            "trajectory_success_rate": (
+                success_trajectories / total_trajectories
+                if total_trajectories > 0
+                else 0.0
+            ),
+            "all_failed_groups": all_failed_groups,
+            "all_failed_group_ratio": (
+                all_failed_groups / total_groups if total_groups > 0 else 0.0
+            ),
+            "groups": self._profile_early_stop_history,
+        }
+        with open(
+            os.path.join(
+                self._profile_early_stop_dir, f"summary_env_rank{self._rank}.json"
+            ),
+            "w",
+            encoding="utf-8",
+        ) as f:
+            json.dump(summary, f, indent=2)
+        return summary
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
@@ -1891,6 +2223,12 @@ class EnvWorker(Worker):
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
+                    self._profile_early_stop_record_chunk(
+                        rollout_epoch_id=epoch,
+                        stage_id=stage_id,
+                        actions=rollout_result.actions,
+                        env_output=env_output,
+                    )
                     if self.collect_slot_metadata:
                         newly_done = self._mark_slot_managers_done(
                             stage_id=stage_id, dones=env_output.dones
@@ -2028,6 +2366,9 @@ class EnvWorker(Worker):
 
         for key, value in env_metrics.items():
             env_metrics[key] = torch.cat(value, dim=0).contiguous().cpu()
+
+        if self._profile_early_stop_active():
+            self._profile_early_stop_step_id += 1
 
         return env_metrics
 

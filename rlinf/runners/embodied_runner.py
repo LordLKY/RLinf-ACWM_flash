@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import logging
+import json
 import os
 import queue
 import threading
@@ -449,12 +450,70 @@ class EmbodiedRunner:
         )
 
     def _finish_run(self) -> None:
+        if bool(self.cfg.get("profile", {}).get("profile_early_stop", False)):
+            summaries = self.env.finalize_profile_early_stop().wait()
+            self._write_profile_early_stop_summary(summaries)
         self.metric_logger.finish()
 
         # Stop logging thread
         self.stop_logging = True
         self.log_queue.join()  # Wait for all queued logs to be processed
         self.log_thread.join(timeout=1.0)
+
+    def _write_profile_early_stop_summary(self, summaries) -> None:
+        if isinstance(summaries, dict):
+            summary_list = [summaries]
+        elif isinstance(summaries, list):
+            summary_list = summaries
+        else:
+            summary_list = []
+        summary_list = [summary for summary in summary_list if summary]
+        if not summary_list:
+            return
+
+        total_groups = sum(int(summary["total_groups"]) for summary in summary_list)
+        total_trajectories = sum(
+            int(summary["total_trajectories"]) for summary in summary_list
+        )
+        success_trajectories = sum(
+            int(summary["success_trajectories"]) for summary in summary_list
+        )
+        failure_trajectories = sum(
+            int(summary["failure_trajectories"]) for summary in summary_list
+        )
+        all_failed_groups = sum(
+            int(summary["all_failed_groups"]) for summary in summary_list
+        )
+        groups = []
+        for summary in summary_list:
+            groups.extend(summary.get("groups", []))
+
+        global_summary = {
+            "total_groups": total_groups,
+            "total_trajectories": total_trajectories,
+            "success_trajectories": success_trajectories,
+            "failure_trajectories": failure_trajectories,
+            "trajectory_success_rate": (
+                success_trajectories / total_trajectories
+                if total_trajectories > 0
+                else 0.0
+            ),
+            "all_failed_groups": all_failed_groups,
+            "all_failed_group_ratio": (
+                all_failed_groups / total_groups if total_groups > 0 else 0.0
+            ),
+            "rank_summaries": summary_list,
+            "groups": groups,
+        }
+        output_dir = os.path.join(
+            str(self.cfg.runner.logger.log_path), "profile_early_stop"
+        )
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(global_summary, f, indent=2)
+        with open(os.path.join(output_dir, "groups.jsonl"), "w", encoding="utf-8") as f:
+            for record in groups:
+                f.write(json.dumps(record) + "\n")
 
     def _should_profile_step(self, step_idx: int) -> bool:
         return self._profile_all_steps or (
