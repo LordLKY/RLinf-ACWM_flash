@@ -653,6 +653,8 @@ class MultiStepRolloutWorker(Worker):
                     merge_fn=self._merge_obs_batches,
                     infer_batch_size_fn=self._infer_env_batch_size,
                 ).async_wait()
+                if self._is_continuous_done(env_output.get("early_stop_done", False)):
+                    return
                 actions, result = self._predict_rollout_actions(
                     env_output["obs"],
                     final_obs=env_output.get("final_obs", None),
@@ -707,6 +709,8 @@ class MultiStepRolloutWorker(Worker):
                 merge_fn=self._merge_obs_batches,
                 infer_batch_size_fn=self._infer_env_batch_size,
             ).async_wait()
+            if self._is_continuous_done(env_output.get("early_stop_done", False)):
+                return
             actions, result = self._predict_rollout_actions(
                 env_output["obs"],
                 final_obs=env_output.get("final_obs", None),
@@ -950,12 +954,24 @@ class MultiStepRolloutWorker(Worker):
             )
             for obs_batch in obs_batches
         ]
+        early_stop_done_flags = [
+            MultiStepRolloutWorker._is_continuous_done(
+                obs_batch.get("early_stop_done", False)
+            )
+            for obs_batch in obs_batches
+        ]
         if any(continuous_done_flags) and not all(continuous_done_flags):
             raise RuntimeError(
                 "continuous_batching received a partial stop across merged env "
                 "shards. Use one-to-one env/rollout placement for continuous batching."
             )
         continuous_done = all(continuous_done_flags)
+        if any(early_stop_done_flags) and not all(early_stop_done_flags):
+            raise RuntimeError(
+                "early_stop_model received a partial stop across merged env shards. "
+                "Use one-to-one env/rollout placement for online early-stop."
+            )
+        early_stop_done = all(early_stop_done_flags)
 
         def _merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
             merged: dict[str, Any] = {}
@@ -1003,6 +1019,7 @@ class MultiStepRolloutWorker(Worker):
             "final_obs": merged_final_obs,
             "rlt_switch_flags": merged_rlt_switch_flags,
             "continuous_done": continuous_done,
+            "early_stop_done": early_stop_done,
         }
 
     def _split_rollout_result(

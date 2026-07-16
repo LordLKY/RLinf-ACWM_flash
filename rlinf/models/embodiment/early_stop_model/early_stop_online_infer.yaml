@@ -1,0 +1,26 @@
+defaults:
+  - _self_
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+
+checkpoint_path: null
+threshold: 0.5
+device: cuda
+torch_dtype: float32
+compile_model: false
+strict_load: true
+model: null
+
+# Optional .pt payload containing actions [N,T,D] or [G,N,T,D].
+input_pt: null
+prefix_steps: null
+
+smoke:
+  num_groups: 2
+  group_size: 8
+  prefix_steps: 64
+  action_dim: 7

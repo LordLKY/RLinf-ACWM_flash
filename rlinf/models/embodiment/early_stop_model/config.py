@@ -44,6 +44,19 @@ class EarlyStopModelConfig:
     action_norm: GroupRMSActionNormConfig = field(default_factory=GroupRMSActionNormConfig)
 
 
+@dataclass
+class EarlyStopOnlineInferenceConfig:
+    """Configuration for online all-fail inference."""
+
+    checkpoint_path: str | None = None
+    threshold: float = 0.5
+    device: str = "cuda"
+    torch_dtype: str = "float32"
+    compile_model: bool = False
+    strict_load: bool = True
+    model: EarlyStopModelConfig | None = None
+
+
 def _as_plain_dict(cfg: Any) -> dict[str, Any]:
     if cfg is None:
         return {}
@@ -89,3 +102,24 @@ def build_early_stop_config(cfg: Any | None = None) -> EarlyStopModelConfig:
             f"Unknown EarlyStopModelConfig keys: {sorted(unknown_model_keys)}"
         )
     return EarlyStopModelConfig(**cfg_dict)
+
+
+def build_online_inference_config(
+    cfg: Any | None = None,
+) -> EarlyStopOnlineInferenceConfig:
+    """Build online inference config from a dataclass, dict, or DictConfig."""
+
+    cfg_dict = _as_plain_dict(cfg)
+    cfg_dict.pop("model_type", None)
+    if "model" in cfg_dict and cfg_dict["model"] is not None:
+        cfg_dict["model"] = build_early_stop_config(cfg_dict["model"])
+    model_keys = {field.name for field in fields(EarlyStopOnlineInferenceConfig)}
+    unknown_keys = set(cfg_dict) - model_keys
+    if unknown_keys:
+        raise ValueError(
+            f"Unknown EarlyStopOnlineInferenceConfig keys: {sorted(unknown_keys)}"
+        )
+    config = EarlyStopOnlineInferenceConfig(**cfg_dict)
+    if not 0.0 <= float(config.threshold) <= 1.0:
+        raise ValueError(f"threshold must be in [0, 1], got {config.threshold}.")
+    return config

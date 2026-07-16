@@ -15,14 +15,21 @@ hydra:
 
 # Number of GPUs to use. The default reproduces wan_libero_spatial_grpo_openvlaoft.
 # Override with e.g. `n_gpu=4`.
-n_gpu: 2
+n_gpu: 2  # for test
 
 profile:
   profile_rollout: False
-  profile_early_stop: True
+  profile_early_stop: False
 
 continuous_batching:
   enabled: False
+
+early_stop_model:
+  enabled: False
+  checkpoint_path: /mnt/kyliu/code/RLinf/rlinf/models/embodiment/early_stop_model/outputs/run_20260715-080548/ckpt/epoch_000100.pt
+  trigger_steps: 64
+  threshold: 0.6
+  device: cuda
 
 cluster:
   num_nodes: 1
@@ -37,11 +44,11 @@ runner:
     experiment_name: "wan_libero_spatial_grpo_openvlaoft_ngpu"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 32  # for test
+  max_epochs: 5  # for test
   max_steps: -1
 
   only_eval: False
-  val_check_interval: -1
+  val_check_interval: 1  # -1  # for test
   save_interval: -1  # 5  # for test
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
@@ -83,7 +90,7 @@ env:
   # - train envs per GPU: 64 / 8 = 8
   # - eval envs per GPU: 496 / 8 = 62
   train:
-    rollout_epoch: 16  # 16  # for test
+    rollout_epoch: 8  # 16  # for test
     total_num_envs: ${multiply:8,${n_gpu}}
     group_size: ${algorithm.group_size}
     max_episode_steps: 256 # max episode steps for truncation
@@ -98,8 +105,8 @@ env:
       save_video: False # RecordVideo does not forward offload for WanEnv.
     num_inference_steps: 5 # default 5, can be set to 3 or 1 for faster inference, but lower quality
   eval:
-    rollout_epoch: 1
-    total_num_envs: ${multiply:62,${n_gpu}} # default 496 when n_gpu=8
+    rollout_epoch: 4
+    total_num_envs: ${multiply:16,${n_gpu}} # default 496 when n_gpu=8  # for test
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 512

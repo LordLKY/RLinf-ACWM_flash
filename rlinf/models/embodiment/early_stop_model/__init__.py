@@ -18,8 +18,10 @@ from rlinf.models.embodiment.early_stop_model.action_processor import (
 )
 from rlinf.models.embodiment.early_stop_model.config import (
     EarlyStopModelConfig,
+    EarlyStopOnlineInferenceConfig,
     GroupRMSActionNormConfig,
     build_early_stop_config,
+    build_online_inference_config,
 )
 from rlinf.models.embodiment.early_stop_model.dataset import (
     EarlyStopProfileDataset,
@@ -33,6 +35,10 @@ from rlinf.models.embodiment.early_stop_model.temporal_setnet import (
     TemporalConvEncoder,
     build_early_stop_model,
 )
+from rlinf.models.embodiment.early_stop_model.inference import (
+    EarlyStopOnlineInferencer,
+    build_online_inferencer,
+)
 
 
 def get_model(cfg, torch_dtype=None):
@@ -45,6 +51,8 @@ def get_model(cfg, torch_dtype=None):
 __all__ = [
     "ConvBlock1D",
     "EarlyStopModelConfig",
+    "EarlyStopOnlineInferenceConfig",
+    "EarlyStopOnlineInferencer",
     "EarlyStopProfileDataset",
     "EarlyStopProfileIndexStats",
     "EarlyStopProfileSample",
@@ -55,6 +63,8 @@ __all__ = [
     "build_action_processor",
     "build_early_stop_config",
     "build_early_stop_model",
+    "build_online_inference_config",
+    "build_online_inferencer",
     "early_stop_profile_collate",
     "get_model",
 ]

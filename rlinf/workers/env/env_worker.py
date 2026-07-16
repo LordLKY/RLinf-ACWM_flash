@@ -496,6 +496,10 @@ class EnvWorker(Worker):
             str(OmegaConf.select(self.cfg, "runner.logger.log_path", default=".")),
             "profile_early_stop",
         )
+        early_stop_cfg = self.cfg.get("early_stop_model", {})
+        self.early_stop_model_enabled = bool(early_stop_cfg.get("enabled", False))
+        self.early_stop_trigger_steps = int(early_stop_cfg.get("trigger_steps", 64))
+        self.early_stop_model_inferencer = None
 
         self.train_enable_offload = (
             train_env_cfg.get("enable_offload", False)
@@ -556,6 +560,9 @@ class EnvWorker(Worker):
             ) >= self._component_placement.get_world_size("rollout"), (
                 "the world size of env must be greater than the world size of rollout in env_decoupled_mode"
             )
+
+        if self.early_stop_model_enabled:
+            self._init_early_stop_model(early_stop_cfg)
 
     def init_worker(self):
         # This is a barrier to ensure all envs' initial setup upon import is done
@@ -1029,6 +1036,395 @@ class EnvWorker(Worker):
         return EmbodiedRolloutResult(
             max_episode_length=self.cfg.env.train.max_episode_steps
         )
+
+    def _init_early_stop_model(self, early_stop_cfg: Any) -> None:
+        if self.continuous_batching_enabled:
+            raise NotImplementedError(
+                "early_stop_model online inference currently supports only "
+                "non-continuous batching."
+            )
+        if self.use_training_pipeline:
+            raise NotImplementedError(
+                "early_stop_model online inference does not support "
+                "use_training_pipeline yet."
+            )
+        if self.collect_transitions:
+            raise NotImplementedError(
+                "early_stop_model online inference does not support "
+                "rollout.collect_transitions yet."
+            )
+        if self.stage_num != 1:
+            raise NotImplementedError(
+                "early_stop_model online inference currently supports one "
+                "rollout pipeline stage."
+            )
+        if bool(self.cfg.env.train.auto_reset):
+            raise NotImplementedError(
+                "early_stop_model online inference requires "
+                "env.train.auto_reset=False."
+            )
+        if bool(self.cfg.env.train.ignore_terminations):
+            raise NotImplementedError(
+                "early_stop_model online inference requires "
+                "env.train.ignore_terminations=False."
+            )
+        group_size = int(self.cfg.algorithm.group_size)
+        if int(self.train_num_envs_per_stage) != group_size:
+            raise NotImplementedError(
+                "early_stop_model online inference currently requires one "
+                f"local group per EnvWorker stage: train_num_envs_per_stage "
+                f"({self.train_num_envs_per_stage}) == group_size ({group_size})."
+            )
+        if self.early_stop_trigger_steps <= 0:
+            raise ValueError(
+                f"early_stop_model.trigger_steps must be positive, got "
+                f"{self.early_stop_trigger_steps}."
+            )
+        max_episode_steps = int(self.cfg.env.train.max_steps_per_rollout_epoch)
+        if self.early_stop_trigger_steps >= max_episode_steps:
+            raise ValueError(
+                "early_stop_model.trigger_steps must be smaller than "
+                "env.train.max_steps_per_rollout_epoch to save rollout compute."
+            )
+
+        infer_cfg = OmegaConf.to_container(early_stop_cfg, resolve=True)
+        if not isinstance(infer_cfg, dict):
+            infer_cfg = {}
+        infer_cfg.pop("enabled", None)
+        infer_cfg.pop("trigger_steps", None)
+        from rlinf.models.embodiment.early_stop_model.inference import (
+            EarlyStopOnlineInferencer,
+        )
+
+        self.early_stop_model_inferencer = EarlyStopOnlineInferencer(infer_cfg)
+
+    def _early_stop_active(self) -> bool:
+        return (
+            self.early_stop_model_enabled
+            and self.early_stop_model_inferencer is not None
+        )
+
+    def _early_stop_epoch_starts(self, stage_id: int) -> dict[str, int]:
+        collector = self.rollout_results[stage_id]
+        return {
+            "actions": len(collector.actions),
+            "rewards": len(collector.rewards),
+            "terminations": len(collector.terminations),
+            "truncations": len(collector.truncations),
+            "dones": len(collector.dones),
+            "prev_logprobs": len(collector.prev_logprobs),
+            "prev_values": len(collector.prev_values),
+            "versions": len(collector.versions),
+            "forward_inputs": len(collector.forward_inputs),
+        }
+
+    @staticmethod
+    def _early_stop_zero_action_in_forward_inputs(
+        forward_inputs: dict[str, Any],
+    ) -> dict[str, Any]:
+        def clone_value(value: Any) -> Any:
+            if isinstance(value, torch.Tensor):
+                return value.detach().clone()
+            if isinstance(value, dict):
+                return {key: clone_value(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [clone_value(item) for item in value]
+            if isinstance(value, tuple):
+                return tuple(clone_value(item) for item in value)
+            return value
+
+        cloned = {key: clone_value(value) for key, value in forward_inputs.items()}
+        for key in ("action", "model_action"):
+            value = cloned.get(key)
+            if isinstance(value, torch.Tensor):
+                cloned[key] = torch.zeros_like(value)
+        return cloned
+
+    @staticmethod
+    def _early_stop_fill_bool_boundaries(
+        values: list[torch.Tensor],
+        start: int,
+        *,
+        fill_value: bool,
+    ) -> None:
+        for idx in range(start, len(values)):
+            values[idx] = torch.full_like(values[idx].bool(), fill_value)
+
+    @staticmethod
+    def _early_stop_zero_tensors(values: list[torch.Tensor], start: int) -> None:
+        for idx in range(start, len(values)):
+            values[idx] = torch.zeros_like(values[idx])
+
+    def _early_stop_discard_and_pad_epoch(
+        self,
+        *,
+        stage_id: int,
+        epoch_starts: dict[str, int],
+        action_template: torch.Tensor,
+        prev_logprobs_template: torch.Tensor | None,
+        prev_values_template: torch.Tensor | None,
+        versions_template: torch.Tensor | None,
+        forward_inputs_template: dict[str, Any] | None,
+        boundary_template: EnvOutput,
+    ) -> None:
+        collector = self.rollout_results[stage_id]
+        target_actions = epoch_starts["actions"] + self.n_train_chunk_steps
+        target_rewards = epoch_starts["rewards"] + self.n_train_chunk_steps
+        target_boundaries = epoch_starts["dones"] + self.n_train_chunk_steps + 1
+
+        self._early_stop_zero_tensors(collector.rewards, epoch_starts["rewards"])
+        self._early_stop_zero_tensors(collector.prev_values, epoch_starts["prev_values"])
+        self._early_stop_fill_bool_boundaries(
+            collector.dones, epoch_starts["dones"], fill_value=True
+        )
+        self._early_stop_fill_bool_boundaries(
+            collector.truncations, epoch_starts["truncations"], fill_value=True
+        )
+        self._early_stop_fill_bool_boundaries(
+            collector.terminations, epoch_starts["terminations"], fill_value=False
+        )
+
+        dummy_action = torch.zeros_like(action_template)
+        dummy_prev_logprobs = (
+            torch.zeros_like(prev_logprobs_template)
+            if prev_logprobs_template is not None
+            else None
+        )
+        dummy_prev_values = (
+            torch.zeros_like(prev_values_template)
+            if prev_values_template is not None
+            else None
+        )
+        dummy_versions = (
+            torch.zeros_like(versions_template)
+            if versions_template is not None
+            else None
+        )
+        dummy_forward_inputs = (
+            self._early_stop_zero_action_in_forward_inputs(forward_inputs_template)
+            if forward_inputs_template
+            else None
+        )
+        if boundary_template.rewards is None:
+            dummy_rewards = torch.zeros_like(
+                boundary_template.dones, dtype=torch.float32
+            )
+        else:
+            dummy_rewards = torch.zeros_like(boundary_template.rewards)
+        dummy_dones = torch.ones_like(boundary_template.dones, dtype=torch.bool)
+        dummy_truncations = torch.ones_like(
+            boundary_template.truncations, dtype=torch.bool
+        )
+        dummy_terminations = torch.zeros_like(
+            boundary_template.terminations, dtype=torch.bool
+        )
+
+        def ensure_not_over(name: str, values: list, target: int) -> None:
+            if len(values) > target:
+                raise RuntimeError(
+                    f"early_stop_model found too many {name} before padding: "
+                    f"current={len(values) - epoch_starts[name]} "
+                    f"expected<={self.n_train_chunk_steps}."
+                )
+
+        ensure_not_over("actions", collector.actions, target_actions)
+        while len(collector.actions) < target_actions:
+            collector.actions.append(dummy_action)
+            collector.intervene_flags.append(
+                torch.zeros_like(dummy_action, dtype=torch.bool)
+            )
+
+        if self.collect_prev_infos and dummy_prev_logprobs is not None:
+            target_prev_logprobs = (
+                epoch_starts["prev_logprobs"] + self.n_train_chunk_steps
+            )
+            ensure_not_over(
+                "prev_logprobs", collector.prev_logprobs, target_prev_logprobs
+            )
+            while len(collector.prev_logprobs) < target_prev_logprobs:
+                collector.prev_logprobs.append(dummy_prev_logprobs)
+
+        if dummy_versions is not None:
+            target_versions = epoch_starts["versions"] + self.n_train_chunk_steps
+            ensure_not_over("versions", collector.versions, target_versions)
+            while len(collector.versions) < target_versions:
+                collector.versions.append(dummy_versions)
+
+        if dummy_forward_inputs is not None:
+            target_forward_inputs = (
+                epoch_starts["forward_inputs"] + self.n_train_chunk_steps
+            )
+            ensure_not_over(
+                "forward_inputs", collector.forward_inputs, target_forward_inputs
+            )
+            while len(collector.forward_inputs) < target_forward_inputs:
+                collector.forward_inputs.append(
+                    self._early_stop_zero_action_in_forward_inputs(
+                        forward_inputs_template
+                    )
+                )
+
+        if len(collector.rewards) > target_rewards:
+            raise RuntimeError(
+                "early_stop_model found too many rewards before padding: "
+                f"current={len(collector.rewards) - epoch_starts['rewards']} "
+                f"expected<={self.n_train_chunk_steps}."
+            )
+        while len(collector.rewards) < target_rewards:
+            collector.rewards.append(dummy_rewards)
+
+        if len(collector.dones) > target_boundaries:
+            raise RuntimeError(
+                "early_stop_model found too many done boundaries before padding: "
+                f"current={len(collector.dones) - epoch_starts['dones']} "
+                f"expected<={self.n_train_chunk_steps + 1}."
+            )
+        while len(collector.dones) < target_boundaries:
+            collector.dones.append(dummy_dones)
+            collector.truncations.append(dummy_truncations)
+            collector.terminations.append(dummy_terminations)
+
+        if self.collect_prev_infos and dummy_prev_values is not None:
+            if len(collector.prev_values) > target_boundaries:
+                raise RuntimeError(
+                    "early_stop_model found too many prev_values before padding: "
+                    f"current={len(collector.prev_values) - epoch_starts['prev_values']} "
+                    f"expected<={self.n_train_chunk_steps + 1}."
+                )
+            while len(collector.prev_values) < target_boundaries:
+                collector.prev_values.append(dummy_prev_values)
+
+        self._early_stop_zero_tensors(collector.rewards, epoch_starts["rewards"])
+        self._early_stop_zero_tensors(collector.prev_values, epoch_starts["prev_values"])
+        self._early_stop_fill_bool_boundaries(
+            collector.dones, epoch_starts["dones"], fill_value=True
+        )
+        self._early_stop_fill_bool_boundaries(
+            collector.truncations, epoch_starts["truncations"], fill_value=True
+        )
+        self._early_stop_fill_bool_boundaries(
+            collector.terminations, epoch_starts["terminations"], fill_value=False
+        )
+
+        epoch_lengths = {
+            "actions": len(collector.actions) - epoch_starts["actions"],
+            "intervene_flags": len(collector.intervene_flags)
+            - epoch_starts["actions"],
+            "rewards": len(collector.rewards) - epoch_starts["rewards"],
+            "dones": len(collector.dones) - epoch_starts["dones"],
+            "versions": len(collector.versions) - epoch_starts["versions"],
+            "forward_inputs": len(collector.forward_inputs)
+            - epoch_starts["forward_inputs"],
+        }
+        if self.collect_prev_infos and dummy_prev_values is not None:
+            epoch_lengths["prev_logprobs"] = (
+                len(collector.prev_logprobs) - epoch_starts["prev_logprobs"]
+            )
+            epoch_lengths["prev_values"] = (
+                len(collector.prev_values) - epoch_starts["prev_values"]
+            )
+        expected = {
+            "actions": self.n_train_chunk_steps,
+            "intervene_flags": self.n_train_chunk_steps,
+            "rewards": self.n_train_chunk_steps,
+            "dones": self.n_train_chunk_steps + 1,
+            "versions": self.n_train_chunk_steps,
+            "forward_inputs": self.n_train_chunk_steps,
+        }
+        if self.collect_prev_infos and dummy_prev_values is not None:
+            expected["prev_logprobs"] = self.n_train_chunk_steps
+            expected["prev_values"] = self.n_train_chunk_steps + 1
+        if epoch_lengths != expected:
+            raise RuntimeError(
+                "early_stop_model failed to pad collector to fixed epoch shape: "
+                f"{epoch_lengths=} {expected=}."
+            )
+
+    def _early_stop_send_done(
+        self,
+        rollout_channel: Channel,
+        *,
+        stage_id: int,
+        env_output: EnvOutput,
+    ) -> None:
+        env_batch = env_output.to_dict()
+        from rlinf.scheduler import infer_batch_size
+
+        data = {
+            "obs": env_batch["obs"],
+            "final_obs": env_batch["final_obs"],
+            "early_stop_done": torch.ones(
+                (infer_batch_size(env_batch["obs"]),), dtype=torch.bool
+            ),
+        }
+        self.send_to(
+            group_name=self.cfg.rollout.group_name,
+            channel=rollout_channel,
+            data=data,
+            mode="train",
+            tag="rollout_results",
+            route_key=stage_id if not self.env_decoupled_mode else None,
+            decoupled_mode=self.env_decoupled_mode,
+        )
+
+    def _early_stop_predict_group(self, action_prefix: torch.Tensor) -> tuple[bool, float]:
+        if action_prefix.dim() != 3:
+            raise ValueError(
+                "early_stop_model action prefix must have shape [N, M, D], "
+                f"got {tuple(action_prefix.shape)}."
+            )
+        if action_prefix.shape[0] != int(self.cfg.algorithm.group_size):
+            raise ValueError(
+                "early_stop_model action prefix batch must equal group_size, "
+                f"got {action_prefix.shape[0]} and {self.cfg.algorithm.group_size}."
+            )
+        actions = action_prefix.unsqueeze(0)
+        decisions, probabilities = self.early_stop_model_inferencer.predict(actions)
+        return bool(decisions[0].item()), float(probabilities[0].item())
+
+    def _early_stop_validate_collector_lengths(
+        self, collector: EmbodiedRolloutResult, *, stage_id: int
+    ) -> None:
+        if not self._early_stop_active():
+            return
+        action_len = self.rollout_epoch * self.n_train_chunk_steps
+        boundary_len = self.rollout_epoch * (self.n_train_chunk_steps + 1)
+        actual = {
+            "actions": len(collector.actions),
+            "intervene_flags": len(collector.intervene_flags),
+            "rewards": len(collector.rewards),
+            "terminations": len(collector.terminations),
+            "truncations": len(collector.truncations),
+            "dones": len(collector.dones),
+            "prev_logprobs": len(collector.prev_logprobs),
+            "prev_values": len(collector.prev_values),
+            "versions": len(collector.versions),
+            "forward_inputs": len(collector.forward_inputs),
+        }
+        expected = {
+            "actions": action_len,
+            "intervene_flags": action_len,
+            "rewards": action_len,
+            "terminations": boundary_len,
+            "truncations": boundary_len,
+            "dones": boundary_len,
+            "versions": action_len,
+            "forward_inputs": action_len,
+        }
+        if self.collect_prev_infos:
+            expected["prev_logprobs"] = action_len
+            expected["prev_values"] = boundary_len
+        mismatches = {
+            key: {"actual": actual[key], "expected": value}
+            for key, value in expected.items()
+            if actual[key] != value
+        }
+        if mismatches:
+            raise RuntimeError(
+                "early_stop_model produced inconsistent collector lengths before "
+                f"sending trajectories: stage_id={stage_id}, "
+                f"{mismatches=}, all_lengths={actual}."
+            )
 
     def _profile_early_stop_active(self) -> bool:
         return self.profile_early_stop_enabled and not self.continuous_batching_enabled
@@ -2078,6 +2474,9 @@ class EnvWorker(Worker):
 
         if actor_channel is not None:
             for stage_id in range(self.stage_num):
+                self._early_stop_validate_collector_lengths(
+                    self.rollout_results[stage_id], stage_id=stage_id
+                )
                 await self.send_rollout_trajectories(
                     self.rollout_results[stage_id], actor_channel
                 )
@@ -2134,9 +2533,20 @@ class EnvWorker(Worker):
             else:
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
             self._ensure_slot_state_managers()
+            early_stop_epoch_starts = [
+                self._early_stop_epoch_starts(stage_id)
+                for stage_id in range(self.stage_num)
+            ]
+            early_stop_action_buffers: list[torch.Tensor | None] = [
+                None for _ in range(self.stage_num)
+            ]
+            early_stop_checked = [False for _ in range(self.stage_num)]
+            early_stop_stopped = [False for _ in range(self.stage_num)]
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
                 for stage_id in range(self.stage_num):
+                    if early_stop_stopped[stage_id]:
+                        continue
                     if cooperative_yield:
                         await asyncio.sleep(0)
 
@@ -2181,7 +2591,9 @@ class EnvWorker(Worker):
                             stage_id=stage_id,
                         )
                     chunk_step_result = ChunkStepResult(
-                        actions=rollout_result.forward_inputs.get("action", None),
+                        actions=rollout_result.forward_inputs.get(
+                            "action", rollout_result.actions
+                        ),
                         prev_logprobs=(
                             rollout_result.prev_logprobs
                             if self.collect_prev_infos
@@ -2229,6 +2641,76 @@ class EnvWorker(Worker):
                         actions=rollout_result.actions,
                         env_output=env_output,
                     )
+                    if self._early_stop_active():
+                        prepared_actions = self._profile_early_stop_actions(
+                            rollout_result.actions, env_output
+                        )
+                        if prepared_actions is not None:
+                            if early_stop_action_buffers[stage_id] is None:
+                                early_stop_action_buffers[stage_id] = prepared_actions
+                            else:
+                                early_stop_action_buffers[stage_id] = torch.cat(
+                                    [
+                                        early_stop_action_buffers[stage_id],
+                                        prepared_actions,
+                                    ],
+                                    dim=1,
+                                )
+                        action_prefix = early_stop_action_buffers[stage_id]
+                        can_check = (
+                            action_prefix is not None
+                            and not early_stop_checked[stage_id]
+                            and action_prefix.shape[1]
+                            >= self.early_stop_trigger_steps
+                            and chunk_step_idx < self.n_train_chunk_steps - 1
+                        )
+                        if can_check:
+                            early_stop_checked[stage_id] = True
+                            prefix = action_prefix[
+                                :, : self.early_stop_trigger_steps
+                            ].contiguous()
+                            discard_group, probability = self._early_stop_predict_group(
+                                prefix
+                            )
+                            env_metrics["early_stop_all_fail_prob"].append(
+                                torch.tensor([probability], dtype=torch.float32)
+                            )
+                            env_metrics["early_stop_triggered"].append(
+                                torch.tensor(
+                                    [1.0 if discard_group else 0.0],
+                                    dtype=torch.float32,
+                                )
+                            )
+                            if discard_group:
+                                self._early_stop_discard_and_pad_epoch(
+                                    stage_id=stage_id,
+                                    epoch_starts=early_stop_epoch_starts[stage_id],
+                                    action_template=rollout_result.forward_inputs.get(
+                                        "action", rollout_result.actions
+                                    ),
+                                    prev_logprobs_template=(
+                                        rollout_result.prev_logprobs
+                                        if self.collect_prev_infos
+                                        else None
+                                    ),
+                                    prev_values_template=(
+                                        rollout_result.prev_values
+                                        if self.collect_prev_infos
+                                        else None
+                                    ),
+                                    versions_template=rollout_result.versions,
+                                    forward_inputs_template=rollout_result.forward_inputs,
+                                    boundary_template=env_output,
+                                )
+                                self._early_stop_send_done(
+                                    rollout_channel,
+                                    stage_id=stage_id,
+                                    env_output=env_output,
+                                )
+                                env_outputs[stage_id] = env_output
+                                early_stop_stopped[stage_id] = True
+                                self.record_env_metrics(env_metrics, env_info)
+                                continue
                     if self.collect_slot_metadata:
                         newly_done = self._mark_slot_managers_done(
                             stage_id=stage_id, dones=env_output.dones
@@ -2278,6 +2760,8 @@ class EnvWorker(Worker):
                     if should_record:
                         self.record_env_metrics(env_metrics, env_info)
             for stage_id in range(self.stage_num):
+                if early_stop_stopped[stage_id]:
+                    continue
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
                     self.rollout_results[stage_id].update_last_actions(
@@ -2357,6 +2841,9 @@ class EnvWorker(Worker):
 
         if not self.use_training_pipeline and actor_channel is not None:
             for stage_id in range(self.stage_num):
+                self._early_stop_validate_collector_lengths(
+                    self.rollout_results[stage_id], stage_id=stage_id
+                )
                 await self.send_rollout_trajectories(
                     self.rollout_results[stage_id], actor_channel
                 )
