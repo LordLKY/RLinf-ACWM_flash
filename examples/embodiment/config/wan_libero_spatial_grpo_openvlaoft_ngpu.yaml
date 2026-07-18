@@ -15,11 +15,15 @@ hydra:
 
 # Number of GPUs to use. The default reproduces wan_libero_spatial_grpo_openvlaoft.
 # Override with e.g. `n_gpu=4`.
-n_gpu: 2  # for test
+n_gpu: 8  # for test
 
 profile:
   profile_rollout: False
   profile_early_stop: False
+  profile_vla_data: False
+  profile_acwm_data: False
+  profile_data_max_groups: 8
+  profile_data_dir: ${runner.logger.log_path}
 
 continuous_batching:
   enabled: False
@@ -34,7 +38,7 @@ early_stop_model:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 6-7  # 0-${subtract:${n_gpu},1}  # for test
+    actor,env,rollout: 0-7  # 0-${subtract:${n_gpu},1}  # for test
 
 runner:
   task_type: embodied
@@ -44,12 +48,12 @@ runner:
     experiment_name: "wan_libero_spatial_grpo_openvlaoft_ngpu"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 5  # for test
+  max_epochs: 64  # for test
   max_steps: -1
 
   only_eval: False
-  val_check_interval: 1  # -1  # for test
-  save_interval: -1  # 5  # for test
+  val_check_interval: 4  # -1  # for test
+  save_interval: 16  # 5  # for test
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
@@ -90,7 +94,7 @@ env:
   # - train envs per GPU: 64 / 8 = 8
   # - eval envs per GPU: 496 / 8 = 62
   train:
-    rollout_epoch: 8  # 16  # for test
+    rollout_epoch: 16  # for test
     total_num_envs: ${multiply:8,${n_gpu}}
     group_size: ${algorithm.group_size}
     max_episode_steps: 256 # max episode steps for truncation
@@ -154,7 +158,7 @@ actor:
     max_prompt_length: 128
 
     # LORA
-    is_lora: True
+    is_lora: False  # for test
     lora_rank: 32
     lora_path: null
 

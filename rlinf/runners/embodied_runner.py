@@ -453,6 +453,12 @@ class EmbodiedRunner:
         if bool(self.cfg.get("profile", {}).get("profile_early_stop", False)):
             summaries = self.env.finalize_profile_early_stop().wait()
             self._write_profile_early_stop_summary(summaries)
+        if bool(self.cfg.get("profile", {}).get("profile_vla_data", False)):
+            summaries = self.env.finalize_profile_vla_data().wait()
+            self._write_profile_slice_summary("profile_vla_data", summaries)
+        if bool(self.cfg.get("profile", {}).get("profile_acwm_data", False)):
+            summaries = self.env.finalize_profile_acwm_data().wait()
+            self._write_profile_slice_summary("profile_acwm_data", summaries)
         self.metric_logger.finish()
 
         # Stop logging thread
@@ -514,6 +520,39 @@ class EmbodiedRunner:
         with open(os.path.join(output_dir, "groups.jsonl"), "w", encoding="utf-8") as f:
             for record in groups:
                 f.write(json.dumps(record) + "\n")
+
+    def _write_profile_slice_summary(self, kind: str, summaries) -> None:
+        def _flatten(items):
+            if isinstance(items, dict):
+                return [items]
+            if isinstance(items, list):
+                flattened = []
+                for item in items:
+                    flattened.extend(_flatten(item))
+                return flattened
+            return []
+
+        summary_list = _flatten(summaries)
+        summary_list = [summary for summary in summary_list if summary]
+        if not summary_list:
+            return
+
+        total_groups = sum(int(summary.get("num_groups", 0)) for summary in summary_list)
+        source_counter = {}
+        for summary in summary_list:
+            for key, value in summary.get("source_counter", {}).items():
+                source_counter[key] = source_counter.get(key, 0) + int(value)
+
+        global_summary = {
+            "kind": kind,
+            "total_groups": total_groups,
+            "source_counter": source_counter,
+            "rank_summaries": summary_list,
+        }
+        output_dir = os.path.join(str(self.cfg.runner.logger.log_path), kind)
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "summary.json"), "w", encoding="utf-8") as f:
+            json.dump(global_summary, f, indent=2)
 
     def _should_profile_step(self, step_idx: int) -> bool:
         return self._profile_all_steps or (

@@ -49,6 +49,7 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
+from rlinf.utils.slice_profile import SliceProfileWriter
 from rlinf.utils.utils import (
     flatten_embodied_batch,
     pack_batch,
@@ -500,6 +501,18 @@ class EnvWorker(Worker):
         self.early_stop_model_enabled = bool(early_stop_cfg.get("enabled", False))
         self.early_stop_trigger_steps = int(early_stop_cfg.get("trigger_steps", 64))
         self.early_stop_model_inferencer = None
+        profile_root = str(
+            profile_cfg.get(
+                "profile_data_dir",
+                OmegaConf.select(self.cfg, "runner.logger.log_path", default="."),
+            )
+        )
+        self.profile_vla_data_enabled = bool(
+            profile_cfg.get("profile_vla_data", False)
+        )
+        self.profile_data_max_groups = int(profile_cfg.get("profile_data_max_groups", 8))
+        self._profile_vla_data_dir = os.path.join(profile_root, "profile_vla_data")
+        self._profile_vla_writer: SliceProfileWriter | None = None
 
         self.train_enable_offload = (
             train_env_cfg.get("enable_offload", False)
@@ -1429,6 +1442,121 @@ class EnvWorker(Worker):
     def _profile_early_stop_active(self) -> bool:
         return self.profile_early_stop_enabled and not self.continuous_batching_enabled
 
+    def _profile_vla_data_active(self) -> bool:
+        return (
+            self.profile_vla_data_enabled
+            and not self.continuous_batching_enabled
+            and not self.early_stop_model_enabled
+        )
+
+    def _ensure_profile_vla_writer(self) -> SliceProfileWriter | None:
+        if not self._profile_vla_data_active():
+            return None
+        if self._profile_vla_writer is None:
+            writer_dir = os.path.join(
+                self._profile_vla_data_dir,
+                f"env_rank{self._rank:04d}_pid{os.getpid()}",
+            )
+            self._profile_vla_writer = SliceProfileWriter(
+                writer_dir,
+                kind="vla",
+                worker_label=f"env_rank{self._rank}",
+                max_groups=self.profile_data_max_groups,
+            )
+        return self._profile_vla_writer
+
+    @staticmethod
+    def _profile_slot_any_mask(
+        value: torch.Tensor | None, batch_size: int
+    ) -> torch.Tensor:
+        if value is None:
+            return torch.zeros(batch_size, dtype=torch.bool)
+        mask = value.detach().cpu().bool()
+        if mask.dim() == 0:
+            return torch.full((batch_size,), bool(mask.item()), dtype=torch.bool)
+        if mask.shape[0] != batch_size:
+            raise ValueError(
+                f"profile slice expected batch size {batch_size}, got {mask.shape[0]}."
+            )
+        if mask.dim() == 1:
+            return mask
+        return mask.reshape(batch_size, -1).any(dim=1)
+
+    def _profile_vla_data_record_chunk(
+        self,
+        *,
+        rollout_epoch_id: int,
+        chunk_step_idx: int,
+        stage_id: int,
+        curr_obs: dict[str, Any],
+        rollout_result: RolloutResult,
+        env_output: EnvOutput,
+    ) -> None:
+        writer = self._ensure_profile_vla_writer()
+        if writer is None or not writer.has_capacity:
+            return
+        action_ref = rollout_result.actions
+        if action_ref is None:
+            action_ref = rollout_result.forward_inputs.get("action", None)
+        if action_ref is None:
+            return
+
+        batch_size = int(action_ref.shape[0])
+        group_size = int(self.cfg.algorithm.group_size)
+        if batch_size <= 0 or batch_size % group_size != 0:
+            return
+
+        done_mask = (
+            self._profile_slot_any_mask(env_output.dones, batch_size)
+            | self._profile_slot_any_mask(env_output.terminations, batch_size)
+            | self._profile_slot_any_mask(env_output.truncations, batch_size)
+        )
+        bootstrap_mask = torch.zeros(batch_size, dtype=torch.bool)
+        if rollout_result.bootstrap_values is not None:
+            bootstrap_mask[:] = True
+
+        eligible_slots = ~(done_mask | bootstrap_mask)
+        eligible_groups = eligible_slots.reshape(-1, group_size).all(dim=1)
+        if not bool(eligible_groups.any().item()):
+            return
+
+        payload = {
+            "input": {
+                "env_obs": curr_obs,
+            },
+            "output": {
+                "actions": rollout_result.actions,
+                "prev_logprobs": rollout_result.prev_logprobs,
+                "prev_values": rollout_result.prev_values,
+                "forward_inputs": rollout_result.forward_inputs,
+                "versions": rollout_result.versions,
+                "save_flags": rollout_result.save_flags,
+            },
+            "validity_check": {
+                "dones": env_output.dones,
+                "terminations": env_output.terminations,
+                "truncations": env_output.truncations,
+                "rewards": env_output.rewards,
+                "bootstrap_values": rollout_result.bootstrap_values,
+            },
+        }
+        writer.record_group_slices(
+            payload,
+            source="env_worker_vla_chunk",
+            batch_size=batch_size,
+            group_size=group_size,
+            eligible_groups=eligible_groups,
+            metadata={
+                "rank": self._rank,
+                "stage_id": stage_id,
+                "rollout_epoch_id": rollout_epoch_id,
+                "chunk_step_idx": chunk_step_idx,
+                "num_action_chunks": int(self.model_cfg.num_action_chunks),
+                "action_dim": int(self.model_cfg.action_dim),
+                "filter": "no_done_no_bootstrap_non_cb_no_early_stop",
+            },
+        )
+
     def _profile_early_stop_ensure_dir(self) -> None:
         os.makedirs(os.path.join(self._profile_early_stop_dir, "groups"), exist_ok=True)
 
@@ -1743,6 +1871,24 @@ class EnvWorker(Worker):
         ) as f:
             json.dump(summary, f, indent=2)
         return summary
+
+    def finalize_profile_vla_data(self) -> dict[str, Any]:
+        writer = self._profile_vla_writer
+        if writer is None:
+            return {}
+        return writer.finalize()
+
+    def finalize_profile_acwm_data(self) -> list[dict[str, Any]]:
+        if not self.enable_train:
+            return []
+        summaries: list[dict[str, Any]] = []
+        for env in self.env_list:
+            finalize_fn = get_env_attr(env, "finalize_profile_acwm_data", None)
+            if callable(finalize_fn):
+                summary = finalize_fn()
+                if summary:
+                    summaries.append(summary)
+        return summaries
 
     def env_evaluate_step(
         self, raw_actions: torch.Tensor, stage_id: int
@@ -2634,6 +2780,14 @@ class EnvWorker(Worker):
 
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
+                    )
+                    self._profile_vla_data_record_chunk(
+                        rollout_epoch_id=epoch,
+                        chunk_step_idx=chunk_step_idx,
+                        stage_id=stage_id,
+                        curr_obs=curr_obs,
+                        rollout_result=rollout_result,
+                        env_output=env_output,
                     )
                     self._profile_early_stop_record_chunk(
                         rollout_epoch_id=epoch,
