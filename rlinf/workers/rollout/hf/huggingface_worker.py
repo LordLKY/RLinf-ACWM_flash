@@ -593,6 +593,8 @@ class MultiStepRolloutWorker(Worker):
 
     async def sync_model_from_actor(self):
         """Sync model parameters from the actor worker."""
+        if self.weight_syncer is None:
+            return
 
         async def recv_func() -> Any:
             return await self.broadcast(

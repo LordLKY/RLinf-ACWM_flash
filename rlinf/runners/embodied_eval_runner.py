@@ -12,6 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
+import os
+import time
 import typing
 
 from rlinf.scheduler import Channel
@@ -19,7 +22,7 @@ from rlinf.scheduler import WorkerGroupFuncResult as Handle
 from rlinf.utils.distributed import ScopedTimer
 from rlinf.utils.logging import get_logger
 from rlinf.utils.metric_logger import MetricLogger
-from rlinf.utils.metric_utils import compute_evaluate_metrics
+from rlinf.utils.metric_utils import compute_evaluate_metrics, print_metrics_table
 
 if typing.TYPE_CHECKING:
     from omegaconf.dictconfig import DictConfig
@@ -77,9 +80,27 @@ class EmbodiedEvalRunner:
         return eval_metrics
 
     def run(self):
+        start_time = time.time()
         eval_metrics = self.evaluate()
         eval_metrics = {f"eval/{k}": v for k, v in eval_metrics.items()}
-        self.logger.info(eval_metrics)
+        if eval_metrics:
+            print_metrics_table(
+                step=0,
+                total_steps=1,
+                start_time=start_time,
+                metrics=eval_metrics,
+                start_step=0,
+                log_path=self.metric_logger.log_path,
+            )
+        else:
+            self.logger.warning("Evaluation finished with no metrics.")
+        self.logger.info(f"Evaluation metrics: {eval_metrics}")
         self.metric_logger.log(step=0, data=eval_metrics)
+
+        output_path = os.path.join(self.metric_logger.log_path, "eval_metrics.json")
+        os.makedirs(self.metric_logger.log_path, exist_ok=True)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(eval_metrics, f, indent=2)
+        self.logger.info(f"Saved evaluation metrics to {output_path}")
 
         self.metric_logger.finish()

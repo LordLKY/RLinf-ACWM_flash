@@ -15,7 +15,7 @@ hydra:
 
 # Number of GPUs to use. The default reproduces wan_libero_spatial_grpo_openvlaoft.
 # Override with e.g. `n_gpu=4`.
-n_gpu: 8  # for test
+n_gpu: 2  # for test
 
 profile:
   profile_rollout: False
@@ -38,7 +38,7 @@ early_stop_model:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 0-7  # 0-${subtract:${n_gpu},1}  # for test
+    actor,env,rollout: 6-7  # 0-${subtract:${n_gpu},1}  # for test
 
 runner:
   task_type: embodied
@@ -51,12 +51,12 @@ runner:
   max_epochs: 50  # for test
   max_steps: -1
 
-  only_eval: False
-  val_check_interval: 5  # -1  # for test
-  save_interval: 10  # 5  # for test
+  only_eval: True  # for test
+  val_check_interval: -1  # -1  # for test
+  save_interval: -1  # 5  # for test
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
-  ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
+  ckpt_path: /mnt/kyliu/code/RLinf/logs/20260718-10:26:10-wan_libero_spatial_grpo_openvlaoft_ngpu/wan_libero_spatial_grpo_openvlaoft_ngpu/checkpoints/global_step_10/actor/model_state_dict/full_weights.pt  # null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
 
 algorithm:
   normalize_advantages: True
@@ -140,6 +140,30 @@ rollout:
     model_path: "/mnt/data/rlinf/checkpoints/Openvla-oft-SFT-libero-spatial-traj1"  # NOTE: need check before running
     precision: ${actor.model.precision}
 
+    # settings for only_eval mode
+    model_type: ${actor.model.model_type}
+    implement_version: ${actor.model.implement_version}
+    value_type: ${actor.model.value_type}
+    action_dim: ${actor.model.action_dim}
+    num_action_chunks: ${actor.model.num_action_chunks}
+    use_proprio: ${actor.model.use_proprio}
+    use_film: ${actor.model.use_film}
+    unnorm_key: ${actor.model.unnorm_key}
+    center_crop: ${actor.model.center_crop}
+    max_prompt_length: ${actor.model.max_prompt_length}
+    vocab_size: ${actor.model.vocab_size}
+    hidden_size: ${actor.model.hidden_size}
+    add_value_head: ${actor.model.add_value_head}
+    image_size: ${actor.model.image_size}
+    is_lora: ${actor.model.is_lora}
+    lora_rank: ${actor.model.lora_rank}
+    lora_path: ${actor.model.lora_path}
+    num_images_in_input: ${actor.model.num_images_in_input}
+    attn_implementation: ${actor.model.attn_implementation}
+    low_cpu_mem_usage: ${actor.model.low_cpu_mem_usage}
+    trust_remote_code: ${actor.model.trust_remote_code}
+    policy_setup: ${actor.model.policy_setup}
+
 actor:
   group_name: "ActorGroup"
   training_backend: "fsdp"
@@ -175,6 +199,7 @@ actor:
   fsdp_config:
     strategy: "fsdp"
     gradient_checkpointing: True
+    save_full_model_weights: False
     mixed_precision:
       param_dtype: ${actor.model.precision}
       reduce_dtype: ${actor.model.precision}

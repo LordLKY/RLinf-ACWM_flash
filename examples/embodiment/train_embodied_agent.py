@@ -19,6 +19,7 @@ import torch.multiprocessing as mp
 from omegaconf.omegaconf import OmegaConf
 
 from rlinf.config import validate_cfg
+from rlinf.runners.embodied_eval_runner import EmbodiedEvalRunner
 from rlinf.runners.embodied_runner import EmbodiedRunner
 from rlinf.scheduler import Cluster
 from rlinf.utils.placement import HybridComponentPlacement
@@ -40,6 +41,26 @@ def main(cfg) -> None:
         cluster_cfg=cfg.cluster, distributed_log_dir=cfg.runner.per_worker_log_path
     )
     component_placement = HybridComponentPlacement(cfg, cluster)
+
+    if cfg.runner.get("only_eval", False):
+        rollout_placement = component_placement.get_strategy("rollout")
+        rollout_group = MultiStepRolloutWorker.create_group(cfg).launch(
+            cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+        )
+
+        env_placement = component_placement.get_strategy("env")
+        env_group = EnvWorker.create_group(cfg).launch(
+            cluster, name=cfg.env.group_name, placement_strategy=env_placement
+        )
+
+        runner = EmbodiedEvalRunner(
+            cfg=cfg,
+            rollout=rollout_group,
+            env=env_group,
+        )
+        runner.init_workers()
+        runner.run()
+        return
 
     # Create actor worker group
     actor_placement = component_placement.get_strategy("actor")
