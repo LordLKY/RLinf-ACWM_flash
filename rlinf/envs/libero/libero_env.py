@@ -715,26 +715,52 @@ class LiberoEnv(gym.Env):
         infos = {}
         return obs, infos
 
-    def step(self, actions=None, auto_reset=True):
+    def step(self, actions=None, auto_reset=True, env_idx=None):
         """Step the environment with the given actions."""
         if isinstance(actions, torch.Tensor):
             actions = actions.detach().cpu().numpy()
 
-        self._elapsed_steps += 1
-        raw_obs, _reward, terminations, info_lists = self.env.step(actions)
-        self.current_raw_obs = raw_obs
-        infos = list_of_dict_to_dict_of_list(info_lists)
-        truncations = self.elapsed_steps >= self.cfg.max_episode_steps
-        obs = self._wrap_obs(raw_obs)
+        if env_idx is None:
+            env_idx = np.arange(self.num_envs)
+            step_all_envs = True
+        else:
+            env_idx = np.asarray(env_idx, dtype=np.int64)
+            step_all_envs = len(env_idx) == self.num_envs
 
-        step_reward = self._calc_step_reward(terminations)
+        self._elapsed_steps[env_idx] += 1
+        raw_obs, _reward, terminations, info_lists = self.env.step(actions, env_idx)
+        if self.current_raw_obs is None:
+            self.current_raw_obs = [None] * self.num_envs
+        if step_all_envs:
+            self.current_raw_obs = raw_obs
+        else:
+            for i, idx in enumerate(env_idx):
+                self.current_raw_obs[idx] = raw_obs[i]
+        infos = list_of_dict_to_dict_of_list(info_lists)
+        raw_terminations = np.asarray(terminations, dtype=bool).copy()
+        terminations = np.zeros(self.num_envs, dtype=bool)
+        terminations[env_idx] = raw_terminations
+        truncations = np.zeros(self.num_envs, dtype=bool)
+        truncations[env_idx] = (
+            self.elapsed_steps[env_idx] >= self.cfg.max_episode_steps
+        )
+        obs = self._wrap_obs(self.current_raw_obs)
+
+        step_reward = self._calc_step_reward(
+            terminations,
+            env_idx=None if step_all_envs else env_idx,
+        )
 
         infos = self._record_metrics(step_reward, terminations, infos)
+        raw_dones = terminations | truncations
+        infos["_raw_terminations"] = to_tensor(terminations.copy())
+        infos["_raw_truncations"] = to_tensor(truncations.copy())
+        infos["_raw_dones"] = to_tensor(raw_dones.copy())
         if self.ignore_terminations:
             infos["episode"]["success_at_end"] = to_tensor(terminations)
             terminations[:] = False
 
-        dones = terminations | truncations
+        dones = raw_dones
         _auto_reset = auto_reset and self.auto_reset
         if dones.any() and _auto_reset:
             obs, infos, _ = self._handle_auto_reset(dones, obs, infos)
@@ -746,6 +772,28 @@ class LiberoEnv(gym.Env):
             infos,
         )
 
+    def _merge_done_info(self, dst, src, done_mask):
+        if src is None:
+            return dst
+        if dst is None:
+            return copy.deepcopy(src)
+        if isinstance(dst, dict) and isinstance(src, dict):
+            for key, src_value in src.items():
+                if key not in dst:
+                    dst[key] = copy.deepcopy(src_value)
+                    continue
+                dst[key] = self._merge_done_info(dst[key], src_value, done_mask)
+            return dst
+        if isinstance(dst, torch.Tensor) and isinstance(src, torch.Tensor):
+            mask = torch.as_tensor(done_mask, dtype=torch.bool, device=dst.device)
+            src_mask = mask.to(device=src.device)
+            dst[mask] = src[src_mask].to(device=dst.device)
+            return dst
+        if isinstance(dst, np.ndarray) and isinstance(src, np.ndarray):
+            dst[done_mask] = src[done_mask]
+            return dst
+        return copy.deepcopy(src)
+
     def chunk_step(self, chunk_actions):
         # chunk_actions: [num_envs, chunk_step, action_dim]
         chunk_size = chunk_actions.shape[1]
@@ -756,17 +804,75 @@ class LiberoEnv(gym.Env):
 
         raw_chunk_terminations = []
         raw_chunk_truncations = []
+        eval_count_mask = None
+        final_info = None
+        final_observation = None
+        final_observation_mask = np.zeros(self.num_envs, dtype=bool)
+        active_env_mask = np.ones(self.num_envs, dtype=bool)
         for i in range(chunk_size):
-            actions = chunk_actions[:, i]
-            extracted_obs, step_reward, terminations, truncations, infos = self.step(
-                actions, auto_reset=False
-            )
+            active_env_idx = np.flatnonzero(active_env_mask)
+            if len(active_env_idx) > 0:
+                actions = chunk_actions[active_env_idx, i]
+                step_env_idx = (
+                    None if len(active_env_idx) == self.num_envs else active_env_idx
+                )
+                extracted_obs, step_reward, terminations, truncations, infos = (
+                    self.step(actions, auto_reset=False, env_idx=step_env_idx)
+                )
+                step_raw_terminations = (
+                    infos.get("_raw_terminations", terminations)
+                    if isinstance(infos, dict)
+                    else terminations
+                )
+                step_raw_truncations = (
+                    infos.get("_raw_truncations", truncations)
+                    if isinstance(infos, dict)
+                    else truncations
+                )
+                if self.is_eval and self.auto_reset:
+                    raw_dones = torch.logical_or(
+                        step_raw_terminations, step_raw_truncations
+                    )
+                    raw_dones_np = raw_dones.cpu().numpy()
+                    if raw_dones.any():
+                        (
+                            extracted_obs,
+                            reset_infos,
+                            step_eval_count_mask,
+                        ) = self._handle_auto_reset(
+                            raw_dones_np, extracted_obs, infos
+                        )
+                        final_info = self._merge_done_info(
+                            final_info,
+                            reset_infos.get("final_info", None),
+                            raw_dones_np,
+                        )
+                        final_observation = self._merge_done_info(
+                            final_observation,
+                            reset_infos.get("final_observation", None),
+                            raw_dones_np,
+                        )
+                        final_observation_mask |= raw_dones_np
+                        if step_eval_count_mask is not None:
+                            if eval_count_mask is None:
+                                eval_count_mask = np.zeros(self.num_envs, dtype=bool)
+                            eval_count_mask |= step_eval_count_mask
+                        active_env_mask[raw_dones_np] = False
+                        infos = reset_infos
+            else:
+                extracted_obs = self._wrap_obs(self.current_raw_obs)
+                step_reward = torch.zeros(self.num_envs, dtype=torch.float32)
+                terminations = torch.zeros(self.num_envs, dtype=torch.bool)
+                truncations = torch.zeros(self.num_envs, dtype=torch.bool)
+                step_raw_terminations = terminations
+                step_raw_truncations = truncations
+                infos = {}
             obs_list.append(extracted_obs)
             infos_list.append(infos)
 
             chunk_rewards.append(step_reward)
-            raw_chunk_terminations.append(terminations)
-            raw_chunk_truncations.append(truncations)
+            raw_chunk_terminations.append(step_raw_terminations)
+            raw_chunk_truncations.append(step_raw_truncations)
 
         chunk_rewards = torch.stack(chunk_rewards, dim=1)  # [num_envs, chunk_steps]
         raw_chunk_terminations = torch.stack(
@@ -781,11 +887,24 @@ class LiberoEnv(gym.Env):
         past_dones = torch.logical_or(past_terminations, past_truncations)
 
         # eval_count_mask: per-env bool, True if this completion counts toward eval metrics.
-        eval_count_mask = None
-        if past_dones.any() and self.auto_reset:
+        if past_dones.any() and self.auto_reset and not self.is_eval:
             obs_list[-1], infos_list[-1], eval_count_mask = self._handle_auto_reset(
                 past_dones.cpu().numpy(), obs_list[-1], infos_list[-1]
             )
+        elif past_dones.any() and self.auto_reset and self.is_eval:
+            if not isinstance(infos_list[-1], dict):
+                infos_list[-1] = {}
+            if final_info is not None:
+                infos_list[-1]["final_info"] = final_info
+            if final_observation is not None:
+                infos_list[-1]["final_observation"] = final_observation
+            infos_list[-1]["_final_info"] = (
+                eval_count_mask
+                if eval_count_mask is not None
+                else np.zeros(self.num_envs, dtype=bool)
+            )
+            infos_list[-1]["_final_observation"] = final_observation_mask
+            infos_list[-1]["_elapsed_steps"] = final_observation_mask
 
         if self.auto_reset or self.ignore_terminations:
             chunk_terminations = torch.zeros_like(raw_chunk_terminations)
@@ -875,14 +994,23 @@ class LiberoEnv(gym.Env):
         infos["_elapsed_steps"] = dones
         return obs, infos
 
-    def _calc_step_reward(self, terminations):
+    def _calc_step_reward(self, terminations, env_idx=None):
         step_penalty = -1 if self.use_step_penalty else 0
         termination_bonus = self.cfg.reward_coef * terminations
         reward = step_penalty + termination_bonus
 
         if self.use_rel_reward:
-            reward_diff = reward - self.prev_step_reward
-            self.prev_step_reward = reward
+            if env_idx is None:
+                reward_diff = reward - self.prev_step_reward
+                self.prev_step_reward = reward
+                return reward_diff
+            reward_diff = np.zeros(self.num_envs, dtype=np.float32)
+            reward_diff[env_idx] = reward[env_idx] - self.prev_step_reward[env_idx]
+            self.prev_step_reward[env_idx] = reward[env_idx]
             return reward_diff
         else:
-            return reward
+            if env_idx is None:
+                return reward
+            full_reward = np.zeros(self.num_envs, dtype=np.float32)
+            full_reward[env_idx] = reward[env_idx]
+            return full_reward
