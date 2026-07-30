@@ -37,6 +37,14 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 
+_DIT_STEP_RECORDER = None
+
+
+def set_dit_step_recorder(recorder):
+    global _DIT_STEP_RECORDER
+    _DIT_STEP_RECORDER = recorder
+
+
 class L1AnalysisCollector:
     """一个用于在推理过程中收集数据并计算相对L1距离的辅助类。"""
     def __init__(self):
@@ -759,6 +767,8 @@ class WanVideoPipeline(BasePipeline):
                 
             # Timestep
             timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+            if _DIT_STEP_RECORDER is not None:
+                _DIT_STEP_RECORDER.begin_step(progress_id, timestep)
 
             # Inference
             noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
@@ -1856,7 +1866,7 @@ def model_fn_wan_video(
     f, h, w = x.shape[2:]
     x = rearrange(x, 'b c f h w -> b (f h w) c').contiguous()
     x_input_for_residual = x
-    if analysis_collector is not None:
+    if analysis_collector is not None or _DIT_STEP_RECORDER is not None:
         x_input_for_residual = x.clone()
 
     # Reference image
@@ -1999,11 +2009,14 @@ def model_fn_wan_video(
                 print(f"  [ModelFn] Block {block_id} slow: {t_layer_end - t_layer_start:.4f}s")
         if tea_cache is not None:
             tea_cache.store(x)
+    if analysis_collector is not None or _DIT_STEP_RECORDER is not None:
+        model_residual = x - x_input_for_residual
     if analysis_collector is not None:
         print(f'x_input_for_residual shape: {x_input_for_residual.shape}, x shape: {x.shape}')
-        model_residual = x - x_input_for_residual
         analysis_collector.update("model_residual", model_residual)
         analysis_collector.update("hidden_states_before_head", x)
+    if _DIT_STEP_RECORDER is not None:
+        _DIT_STEP_RECORDER.save_residual(model_residual)
     
     x = dit.head(x, t)
 

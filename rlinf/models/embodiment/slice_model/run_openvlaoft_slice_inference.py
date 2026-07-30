@@ -28,7 +28,6 @@ from omegaconf import OmegaConf, open_dict
 from rlinf.models import get_model
 from rlinf.models.embodiment.slice_model.common import (
     default_local_src_dir,
-    ensure_output_dir,
     export_vla_input,
     export_vla_output,
     load_hydra_config,
@@ -180,7 +179,7 @@ def run_slice(args: argparse.Namespace) -> dict[str, Any]:
         os.environ.setdefault("RLINF_USE_NVTX", "1")
     elif args.output_dir is None:
         raise ValueError("--output-dir is required unless --profile is enabled")
-    output_dir = ensure_output_dir(args.output_dir) if args.output_dir is not None else None
+    output_dir = reset_export_dir(args.output_dir) if args.output_dir is not None else None
 
     device = torch.device(args.device)
     local_prismatic_src = prepend_local_src(

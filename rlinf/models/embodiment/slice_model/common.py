@@ -305,10 +305,15 @@ def export_vla_output(output_payload: dict[str, Any], output_dir: str | Path) ->
         save_array_text(value, output_dir / "actions.txt", name="actions")
 
 
-def export_acwm_input(input_payload: dict[str, Any], output_dir: str | Path) -> None:
+def export_acwm_input(
+    input_payload: dict[str, Any],
+    output_dir: str | Path,
+    *,
+    save_current_obs_frames: bool = True,
+) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if "current_obs" in input_payload:
+    if save_current_obs_frames and "current_obs" in input_payload:
         save_wan_frames(input_payload["current_obs"], output_dir / "current_obs_frames")
     value = input_payload.get("policy_output_action")
     if isinstance(value, (torch.Tensor, np.ndarray)):

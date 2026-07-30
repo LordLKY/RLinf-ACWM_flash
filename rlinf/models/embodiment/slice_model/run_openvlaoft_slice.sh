@@ -34,6 +34,7 @@ COMPARE=${COMPARE:-0}
 SAVE_PT=${SAVE_PT:-0}
 CKPT_PATH=${CKPT_PATH:-}
 GPU=${GPU:-}
+CLEAN_OUTPUT=${CLEAN_OUTPUT:-1}
 
 is_true() {
   case "${1,,}" in
@@ -44,6 +45,24 @@ is_true() {
 
 if [[ -n "${GPU}" ]]; then
   export CUDA_VISIBLE_DEVICES="${GPU}"
+fi
+
+clean_output_dir() {
+  local dir="$1"
+  case "${dir}" in
+    "${REPO_ROOT}/profile/openvlaoft_slice/results/"*)
+      rm -rf -- "${dir}"
+      mkdir -p -- "${dir}"
+      ;;
+    *)
+      echo "[openvlaoft-slice] refusing to clean output outside profile/openvlaoft_slice/results: ${dir}" >&2
+      return 1
+      ;;
+  esac
+}
+
+if ! is_true "${PROFILE}" && is_true "${CLEAN_OUTPUT}"; then
+  clean_output_dir "${OUTPUT_DIR}"
 fi
 
 cmd=(

@@ -15,7 +15,7 @@ hydra:
 
 # Number of GPUs to use. The default reproduces wan_libero_spatial_grpo_openvlaoft.
 # Override with e.g. `n_gpu=4`.
-n_gpu: 2  # for test
+n_gpu: 4  # for test
 
 profile:
   profile_rollout: False
@@ -38,7 +38,7 @@ early_stop_model:
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 6-7  # 0-${subtract:${n_gpu},1}  # for test
+    actor,env,rollout: 4-7  # 0-${subtract:${n_gpu},1}  # for test
 
 runner:
   task_type: embodied
@@ -48,12 +48,12 @@ runner:
     experiment_name: "wan_libero_spatial_grpo_openvlaoft_ngpu"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 50  # for test
+  max_epochs: 60  # for test
   max_steps: -1
 
-  only_eval: True  # for test
-  val_check_interval: -1  # -1  # for test
-  save_interval: -1  # 5  # for test
+  only_eval: False  # for test
+  val_check_interval: 3 # for test
+  save_interval: 10  # for test
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: /mnt/kyliu/code/RLinf/logs/20260718-10:26:10-wan_libero_spatial_grpo_openvlaoft_ngpu/wan_libero_spatial_grpo_openvlaoft_ngpu/checkpoints/global_step_10/actor/model_state_dict/full_weights.pt  # null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
@@ -210,3 +210,7 @@ reward:
 
 critic:
   use_critic_model: False
+
+
+# nohup bash examples/embodiment/run_embodiment.sh wan_libero_spatial_grpo_openvlaoft_ngpu \
+#     > logs/run_wan_libero_$(date +%Y%m%d_%H%M%S).out 2>&1 &
