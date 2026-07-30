@@ -20,6 +20,7 @@ import io
 import json
 import os
 from collections import deque
+from contextlib import nullcontext
 from typing import Optional, Union
 
 import numpy as np
@@ -31,13 +32,30 @@ from omegaconf import OmegaConf
 # OpenSora imports
 from opensora.registry import MODELS, SCHEDULERS, build_module
 from opensora.utils.inference_utils import prepare_multi_resolution_info
-from opensora.utils.misc import to_torch_dtype
 
 from rlinf.data.datasets.world_model import NpyTrajectoryDatasetWrapper
 from rlinf.envs.utils import recursive_to_device
 from rlinf.envs.world_model.base_world_env import BaseWorldEnv
+from rlinf.utils.utils import nvtx_range
 
 __all__ = ["OpenSoraEnv"]
+
+
+def to_torch_dtype(dtype):
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    dtype_mapping = {
+        "float64": torch.float64,
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "fp32": torch.float32,
+        "fp16": torch.float16,
+        "half": torch.float16,
+        "bf16": torch.bfloat16,
+    }
+    if dtype not in dtype_mapping:
+        raise ValueError(f"Unsupported OpenSora inference dtype: {dtype}")
+    return dtype_mapping[dtype]
 
 
 class OpenSoraEnv(BaseWorldEnv):
@@ -137,6 +155,39 @@ class OpenSoraEnv(BaseWorldEnv):
             self.inference_dtype,
         )
         self._is_offloaded = False
+        self._init_rollout_profile()
+
+    def _init_rollout_profile(self):
+        profile_cfg = self.cfg.get("profile", {})
+        self.profile_rollout = bool(
+            profile_cfg.get("profile_rollout", self.cfg.get("profile_rollout", False))
+        )
+        if self.profile_rollout:
+            os.environ.setdefault("RLINF_USE_NVTX", "1")
+            self._patch_opensora_nvtx()
+
+    def _patch_opensora_nvtx(self):
+        """Add NVTX ranges to OpenSora internals without modifying OpenSora sources."""
+        if getattr(self, "_rlinf_opensora_nvtx_patched", False):
+            return
+
+        model_forward = self.model.forward
+
+        def nvtx_model_forward(*args, **kwargs):
+            with nvtx_range("env/opensora_model_forward"):
+                return model_forward(*args, **kwargs)
+
+        self.model.forward = nvtx_model_forward
+
+        vae_encode = self.vae.encode
+
+        def nvtx_vae_encode(*args, **kwargs):
+            with nvtx_range("env/opensora_vae_encode"):
+                return vae_encode(*args, **kwargs)
+
+        self.vae.encode = nvtx_vae_encode
+
+        self._rlinf_opensora_nvtx_patched = True
 
     def _build_dataset(self, cfg):
         return NpyTrajectoryDatasetWrapper(cfg.initial_image_path)
@@ -604,7 +655,8 @@ class OpenSoraEnv(BaseWorldEnv):
             )  # [num_envs * chunk, 3, h, w]
             extract_chunk_obs = extract_chunk_obs.to(self.device)
 
-            rewards = self.reward_model.predict_rew(extract_chunk_obs)
+            with nvtx_range("env/opensora_reward_model_forward"):
+                rewards = self.reward_model.predict_rew(extract_chunk_obs)
             rewards = rewards.reshape(self.num_envs, self.chunk)
         else:
             raise ValueError(
@@ -676,15 +728,16 @@ class OpenSoraEnv(BaseWorldEnv):
         y = actions_batch.to(self.device).to(self.inference_dtype)
 
         # Sample using scheduler with batch processing
-        samples = self.scheduler.sample(
-            self.model,
-            z=z_full,
-            y=y,
-            device=self.device,
-            additional_args=self.model_args,
-            progress=False,
-            mask=masks,
-        )
+        with nvtx_range("env/opensora_scheduler_sample"):
+            samples = self.scheduler.sample(
+                self.model,
+                z=z_full,
+                y=y,
+                device=self.device,
+                additional_args=self.model_args,
+                progress=False,
+                mask=masks,
+            )
 
         # Extract only the generated frames (masked part): [num_envs, C, T_mask, H', W']
         pred_latents = samples[:, :, -self.z_mask_frame_num :, :, :].to(
@@ -704,7 +757,8 @@ class OpenSoraEnv(BaseWorldEnv):
                     self.image_queue[env_idx].append(frame)
 
             # Decode with num_frames parameter: [num_envs, C, T_mask, H', W'] -> [num_envs, C, T, H, W]
-            pred_images = self.vae.decode(pred_latents, num_frames=12)
+            with nvtx_range("env/opensora_vae_decode"):
+                pred_images = self.vae.decode(pred_latents, num_frames=12)
         else:
             # For regular VAE, chunk into action_chunk_length parts
             for env_idx in range(num_envs):
@@ -715,7 +769,8 @@ class OpenSoraEnv(BaseWorldEnv):
                     self.image_queue[env_idx].append(frame)
 
             # Decode: [num_envs, C, T_mask, H', W'] -> [num_envs, C, T, H, W]
-            pred_images = self.vae.decode(pred_latents)
+            with nvtx_range("env/opensora_vae_decode"):
+                pred_images = self.vae.decode(pred_latents)
 
         # pred_images shape: [num_envs, C, T, H, W] where T depends on VAE type
 
@@ -810,9 +865,14 @@ class OpenSoraEnv(BaseWorldEnv):
         self.onload()
         # policy_output_action: [num_envs, chunk, action_dim]
 
-        with torch.amp.autocast(device_type="cuda", dtype=self.inference_dtype):
-            # Infer next chunk frames
-            self._infer_next_chunk_frames(policy_output_action)
+        autocast_context = (
+            torch.amp.autocast(device_type=self.device.type, dtype=self.inference_dtype)
+            if self.device.type != "cpu"
+            else nullcontext()
+        )
+        with autocast_context:
+            with nvtx_range("env/opensora_infer_next_chunk_frames"):
+                self._infer_next_chunk_frames(policy_output_action)
 
         # Update elapsed steps
         self.elapsed_steps += self.chunk
@@ -821,7 +881,8 @@ class OpenSoraEnv(BaseWorldEnv):
         obs_list = [extracted_obs]
 
         # Get rewards
-        chunk_rewards = self._infer_next_chunk_rewards()
+        with nvtx_range("env/opensora_infer_next_chunk_rewards"):
+            chunk_rewards = self._infer_next_chunk_rewards()
         chunk_rewards_tensors = self._calc_step_reward(chunk_rewards)
 
         # Estimate success (terminations) based on rewards
