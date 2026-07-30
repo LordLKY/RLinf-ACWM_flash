@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,50 @@ def repo_root() -> Path:
 
 def default_config_dir() -> Path:
     return repo_root() / "examples" / "embodiment" / "config"
+
+
+def default_local_src_dir(name: str) -> Path:
+    return Path(__file__).resolve().parent / "local_src" / name
+
+
+def prepend_local_src(path: str | Path | None, *, package_name: str) -> Path | None:
+    if path is None:
+        return None
+
+    src_dir = Path(path).expanduser().resolve()
+    package_dir = src_dir / package_name
+    if not src_dir.is_dir():
+        raise FileNotFoundError(f"Local source directory does not exist: {src_dir}")
+    if not package_dir.is_dir():
+        raise FileNotFoundError(
+            f"Local source directory {src_dir} must contain package {package_name!r}."
+        )
+
+    loaded_module = sys.modules.get(package_name)
+    if loaded_module is not None:
+        module_file_raw = getattr(loaded_module, "__file__", None)
+        module_paths = []
+        if module_file_raw:
+            module_paths.append(Path(module_file_raw).resolve())
+        module_paths.extend(
+            Path(item).resolve() for item in getattr(loaded_module, "__path__", [])
+        )
+        if not any(package_dir in (path, *path.parents) for path in module_paths):
+            loaded_from = module_paths[0] if module_paths else "<unknown>"
+            raise RuntimeError(
+                f"Package {package_name!r} was already imported from {loaded_from}; "
+                "local source overlay must be installed before the package is imported."
+            )
+
+    src_str = str(src_dir)
+    sys.path[:] = [p for p in sys.path if Path(p or ".").resolve() != src_dir]
+    sys.path.insert(0, src_str)
+
+    pythonpath = os.environ.get("PYTHONPATH", "")
+    entries = [entry for entry in pythonpath.split(os.pathsep) if entry]
+    entries = [entry for entry in entries if Path(entry).expanduser().resolve() != src_dir]
+    os.environ["PYTHONPATH"] = os.pathsep.join([src_str, *entries])
+    return src_dir
 
 
 def load_hydra_config(
@@ -270,10 +315,19 @@ def export_acwm_input(input_payload: dict[str, Any], output_dir: str | Path) -> 
         save_array_text(value, output_dir / "actions.txt", name="policy_output_action")
 
 
-def export_acwm_output(output_payload: dict[str, Any], output_dir: str | Path) -> None:
+def export_acwm_output(
+    output_payload: dict[str, Any],
+    output_dir: str | Path,
+    *,
+    save_current_obs_frames: bool = False,
+) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    if "current_obs" in output_payload and output_payload["current_obs"] is not None:
+    if (
+        save_current_obs_frames
+        and "current_obs" in output_payload
+        and output_payload["current_obs"] is not None
+    ):
         save_wan_frames(output_payload["current_obs"], output_dir / "current_obs_frames")
     extracted_obs = output_payload.get("extracted_obs")
     if isinstance(extracted_obs, dict):
