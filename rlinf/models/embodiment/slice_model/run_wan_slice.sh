@@ -36,8 +36,19 @@ MAX_CHUNKS=${MAX_CHUNKS:-}
 GPU=${GPU:-}
 CLEAN_OUTPUT=${CLEAN_OUTPUT:-1}
 
-# profile
+# profile for nsys
 PROFILE=${PROFILE:-0}
+
+# profile for scale
+PROFILE_SCALE=${PROFILE_SCALE:-1}
+PROFILE_SCALE_MODULES=${PROFILE_SCALE_MODULES:-1}
+SCALE_BATCH_SIZES=${SCALE_BATCH_SIZES:-1,2,4,6,8,10,12}
+PROFILE_SCALE_ITERS=${PROFILE_SCALE_ITERS:-10}
+PROFILE_SCALE_WARMUP=${PROFILE_SCALE_WARMUP:-4}
+PROFILE_SCALE_STOP_ON_OOM=${PROFILE_SCALE_STOP_ON_OOM:-1}
+PROFILE_SCALE_EMPTY_CACHE=${PROFILE_SCALE_EMPTY_CACHE:-1}
+
+# profile for cache
 DUMP_DIT_RESIDUALS=${DUMP_DIT_RESIDUALS:-1}
 DIT_RESIDUAL_DIR=${DIT_RESIDUAL_DIR:-"${REPO_ROOT}/profile/wan_slice/dit_residual"}
 SHARE_INITIAL_NOISE=${SHARE_INITIAL_NOISE:-1}
@@ -67,7 +78,7 @@ clean_output_dir() {
   esac
 }
 
-if ! is_true "${PROFILE}" && is_true "${CLEAN_OUTPUT}"; then
+if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && is_true "${CLEAN_OUTPUT}"; then
   clean_output_dir "${OUTPUT_DIR}"
 fi
 
@@ -87,11 +98,31 @@ fi
 
 if is_true "${PROFILE}"; then
   cmd+=(--profile)
+elif is_true "${PROFILE_SCALE}"; then
+  cmd+=(
+    --profile-scale
+    --scale-batch-sizes "${SCALE_BATCH_SIZES}"
+    --profile-scale-iters "${PROFILE_SCALE_ITERS}"
+    --profile-scale-warmup "${PROFILE_SCALE_WARMUP}"
+  )
+  if is_true "${PROFILE_SCALE_STOP_ON_OOM}"; then
+    cmd+=(--profile-scale-stop-on-oom)
+  else
+    cmd+=(--no-profile-scale-stop-on-oom)
+  fi
+  if is_true "${PROFILE_SCALE_EMPTY_CACHE}"; then
+    cmd+=(--profile-scale-empty-cache)
+  else
+    cmd+=(--no-profile-scale-empty-cache)
+  fi
+  if is_true "${PROFILE_SCALE_MODULES}"; then
+    cmd+=(--profile-scale-modules)
+  fi
 else
   cmd+=(--output-dir "${OUTPUT_DIR}")
 fi
 
-if is_true "${SEQUENCE}"; then
+if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && is_true "${SEQUENCE}"; then
   cmd+=(--sequence --sequence-mode "${SEQUENCE_MODE}")
 fi
 
@@ -111,7 +142,7 @@ if is_true "${SAVE_OUTPUT_CURRENT_OBS_FRAMES}"; then
   cmd+=(--save-output-current-obs-frames)
 fi
 
-if is_true "${DUMP_DIT_RESIDUALS}"; then
+if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && is_true "${DUMP_DIT_RESIDUALS}"; then
   cmd+=(--dump-dit-residuals --dit-residual-dir "${DIT_RESIDUAL_DIR}")
 fi
 
@@ -127,13 +158,20 @@ echo "[wan-slice] slice: ${SLICE_NAME}"
 echo "[wan-slice] local wan src: ${LOCAL_WAN_SRC}"
 if is_true "${PROFILE}"; then
   echo "[wan-slice] mode: profile"
+elif is_true "${PROFILE_SCALE}"; then
+  if is_true "${PROFILE_SCALE_MODULES}"; then
+    echo "[wan-slice] mode: profile_scale_modules"
+  else
+    echo "[wan-slice] mode: profile_scale"
+  fi
+  echo "[wan-slice] scale batch sizes: ${SCALE_BATCH_SIZES}"
 elif is_true "${SEQUENCE}"; then
   echo "[wan-slice] mode: sequence/${SEQUENCE_MODE}"
   echo "[wan-slice] output: ${OUTPUT_DIR}"
 else
   echo "[wan-slice] output: ${OUTPUT_DIR}"
 fi
-if is_true "${DUMP_DIT_RESIDUALS}"; then
+if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && is_true "${DUMP_DIT_RESIDUALS}"; then
   echo "[wan-slice] dit residuals: ${DIT_RESIDUAL_DIR}"
 fi
 if is_true "${SHARE_INITIAL_NOISE}"; then

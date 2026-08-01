@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -135,6 +136,94 @@ def save_pt(data: Any, path: str | Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(clone_nested_to_cpu(data), path)
+
+
+def parse_batch_sizes(value: str | list[int] | tuple[int, ...]) -> list[int]:
+    if isinstance(value, str):
+        parts = [part.strip() for part in value.split(",") if part.strip()]
+        if not parts:
+            raise ValueError("Batch size list must not be empty.")
+        batch_sizes = [int(part) for part in parts]
+    else:
+        batch_sizes = [int(item) for item in value]
+    if any(batch_size <= 0 for batch_size in batch_sizes):
+        raise ValueError(f"Batch sizes must be positive, got {batch_sizes}.")
+    seen = set()
+    unique_batch_sizes = []
+    for batch_size in batch_sizes:
+        if batch_size in seen:
+            continue
+        seen.add(batch_size)
+        unique_batch_sizes.append(batch_size)
+    return unique_batch_sizes
+
+
+def _scaled_indices(source_batch_size: int, target_batch_size: int) -> list[int]:
+    if source_batch_size <= 0:
+        raise ValueError(f"source_batch_size must be positive, got {source_batch_size}.")
+    return [idx % source_batch_size for idx in range(target_batch_size)]
+
+
+def scale_nested_batch(value: Any, *, source_batch_size: int, target_batch_size: int) -> Any:
+    indices = _scaled_indices(source_batch_size, target_batch_size)
+    if isinstance(value, torch.Tensor):
+        if value.ndim > 0 and int(value.shape[0]) == source_batch_size:
+            index = torch.as_tensor(indices, dtype=torch.long, device=value.device)
+            return value.index_select(0, index).clone().contiguous()
+        return value.clone() if value.device.type == "cpu" else value
+    if isinstance(value, np.ndarray):
+        if value.ndim > 0 and int(value.shape[0]) == source_batch_size:
+            return np.take(value, indices, axis=0).copy()
+        return value.copy()
+    if isinstance(value, dict):
+        return {
+            key: scale_nested_batch(
+                item,
+                source_batch_size=source_batch_size,
+                target_batch_size=target_batch_size,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        if len(value) == source_batch_size:
+            return [copy.deepcopy(value[idx]) for idx in indices]
+        return copy.deepcopy(value)
+    if isinstance(value, tuple):
+        if len(value) == source_batch_size:
+            return tuple(copy.deepcopy(value[idx]) for idx in indices)
+        return copy.deepcopy(value)
+    return copy.deepcopy(value)
+
+
+def is_cuda_oom(error: BaseException) -> bool:
+    if isinstance(error, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(error).lower()
+    return "cuda out of memory" in message or "outofmemoryerror" in message
+
+
+def cuda_memory_snapshot(device: torch.device | str) -> dict[str, int] | None:
+    device = torch.device(device)
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+    torch.cuda.synchronize(device)
+    return {
+        "allocated_bytes": int(torch.cuda.memory_allocated(device)),
+        "reserved_bytes": int(torch.cuda.memory_reserved(device)),
+        "max_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
+        "max_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
+    }
+
+
+def bytes_to_gb(value: int | float) -> float:
+    return round(float(value) / (1024**3), 3)
+
+
+def reset_cuda_peak_memory(device: torch.device | str) -> None:
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+        torch.cuda.reset_peak_memory_stats(device)
 
 
 def summarize_nested(value: Any) -> Any:

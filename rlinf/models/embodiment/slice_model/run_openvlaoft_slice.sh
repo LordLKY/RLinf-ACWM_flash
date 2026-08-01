@@ -29,7 +29,20 @@ SEED=${SEED:-0}
 MODE=${MODE:-train}
 MODEL_SOURCE=${MODEL_SOURCE:-actor}
 LOCAL_PRISMATIC_SRC=${LOCAL_PRISMATIC_SRC:-"${SCRIPT_DIR}/local_src/openvla_oft"}
+
+# profile for nsys
 PROFILE=${PROFILE:-0}
+
+# profile for scale
+PROFILE_SCALE=${PROFILE_SCALE:-1}
+PROFILE_SCALE_MODULES=${PROFILE_SCALE_MODULES:-1}
+SCALE_BATCH_SIZES=${SCALE_BATCH_SIZES:-1,2,4,8,16,24,32}
+PROFILE_SCALE_ITERS=${PROFILE_SCALE_ITERS:-10}
+PROFILE_SCALE_WARMUP=${PROFILE_SCALE_WARMUP:-4}
+PROFILE_SCALE_STOP_ON_OOM=${PROFILE_SCALE_STOP_ON_OOM:-1}
+PROFILE_SCALE_EMPTY_CACHE=${PROFILE_SCALE_EMPTY_CACHE:-1}
+
+# other profile
 COMPARE=${COMPARE:-0}
 SAVE_PT=${SAVE_PT:-0}
 CKPT_PATH=${CKPT_PATH:-}
@@ -61,7 +74,7 @@ clean_output_dir() {
   esac
 }
 
-if ! is_true "${PROFILE}" && is_true "${CLEAN_OUTPUT}"; then
+if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && is_true "${CLEAN_OUTPUT}"; then
   clean_output_dir "${OUTPUT_DIR}"
 fi
 
@@ -87,6 +100,26 @@ fi
 
 if is_true "${PROFILE}"; then
   cmd+=(--profile)
+elif is_true "${PROFILE_SCALE}"; then
+  cmd+=(
+    --profile-scale
+    --scale-batch-sizes "${SCALE_BATCH_SIZES}"
+    --profile-scale-iters "${PROFILE_SCALE_ITERS}"
+    --profile-scale-warmup "${PROFILE_SCALE_WARMUP}"
+  )
+  if is_true "${PROFILE_SCALE_STOP_ON_OOM}"; then
+    cmd+=(--profile-scale-stop-on-oom)
+  else
+    cmd+=(--no-profile-scale-stop-on-oom)
+  fi
+  if is_true "${PROFILE_SCALE_EMPTY_CACHE}"; then
+    cmd+=(--profile-scale-empty-cache)
+  else
+    cmd+=(--no-profile-scale-empty-cache)
+  fi
+  if is_true "${PROFILE_SCALE_MODULES}"; then
+    cmd+=(--profile-scale-modules)
+  fi
 else
   cmd+=(--output-dir "${OUTPUT_DIR}")
 fi
@@ -107,6 +140,13 @@ echo "[openvlaoft-slice] slice: ${SLICE_NAME}"
 echo "[openvlaoft-slice] local prismatic src: ${LOCAL_PRISMATIC_SRC}"
 if is_true "${PROFILE}"; then
   echo "[openvlaoft-slice] mode: profile"
+elif is_true "${PROFILE_SCALE}"; then
+  if is_true "${PROFILE_SCALE_MODULES}"; then
+    echo "[openvlaoft-slice] mode: profile_scale_modules"
+  else
+    echo "[openvlaoft-slice] mode: profile_scale"
+  fi
+  echo "[openvlaoft-slice] scale batch sizes: ${SCALE_BATCH_SIZES}"
 else
   echo "[openvlaoft-slice] output: ${OUTPUT_DIR}"
 fi

@@ -48,12 +48,12 @@ runner:
     experiment_name: "wan_libero_spatial_grpo_openvlaoft_ngpu"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 60  # for test
+  max_epochs: 64  # for test
   max_steps: -1
 
   only_eval: False  # for test
   val_check_interval: 3 # for test
-  save_interval: 10  # for test
+  save_interval: 9  # for test
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: /mnt/kyliu/code/RLinf/logs/20260718-10:26:10-wan_libero_spatial_grpo_openvlaoft_ngpu/wan_libero_spatial_grpo_openvlaoft_ngpu/checkpoints/global_step_10/actor/model_state_dict/full_weights.pt  # null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).

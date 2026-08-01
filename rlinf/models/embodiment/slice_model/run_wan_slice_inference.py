@@ -27,16 +27,22 @@ import torch
 from omegaconf import OmegaConf, open_dict
 
 from rlinf.models.embodiment.slice_model.common import (
+    bytes_to_gb,
+    cuda_memory_snapshot,
     default_local_src_dir,
     export_acwm_input,
     export_acwm_output,
+    is_cuda_oom,
     load_hydra_config,
     load_slice_sample,
+    parse_batch_sizes,
     prepend_local_src,
     repo_root,
     reset_export_dir,
+    reset_cuda_peak_memory,
     save_json,
     save_pt,
+    scale_nested_batch,
     tensor_diff_summary,
 )
 from rlinf.scheduler import Worker
@@ -66,6 +72,45 @@ class DitResidualRecorder:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(residual.detach().to(device="cpu", dtype=torch.float32), output_path)
         self.saved_steps.add(self.step_index)
+
+
+class WanModuleCallProfiler:
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.records: dict[str, list[dict[str, Any]]] = {
+            "dit": [],
+            "vae_decode": [],
+        }
+
+    def clear(self) -> None:
+        for records in self.records.values():
+            records.clear()
+
+    def measure(self, module_name: str, func, *args, **kwargs):
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+            reset_cuda_peak_memory(self.device)
+        start = time.perf_counter()
+        with torch.no_grad(), nvtx_range(f"slice/wan_module/{module_name}"):
+            output = func(*args, **kwargs)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start
+        peak_memory = cuda_memory_snapshot(self.device)
+        record = {"elapsed_seconds": float(elapsed)}
+        if peak_memory is not None:
+            record.update(
+                {
+                    "peak_memory_allocated_gb": bytes_to_gb(
+                        peak_memory["max_allocated_bytes"]
+                    ),
+                    "peak_memory_reserved_gb": bytes_to_gb(
+                        peak_memory["max_reserved_bytes"]
+                    ),
+                }
+            )
+        self.records[module_name].append(record)
+        return output
 
 
 def _set_dit_step_recorder(recorder: DitResidualRecorder | None) -> None:
@@ -114,6 +159,38 @@ def parse_args() -> argparse.Namespace:
         "--profile",
         action="store_true",
         help="Run the slice inference 10 times without exporting outputs.",
+    )
+    parser.add_argument(
+        "--profile-scale",
+        action="store_true",
+        help="Sweep batch sizes and report latency per sample and CUDA peak memory.",
+    )
+    parser.add_argument(
+        "--profile-scale-modules",
+        action="store_true",
+        help=(
+            "With --profile-scale, report Wan module-level scale results for "
+            "DiT and VAE decode instead of whole chunk_step results."
+        ),
+    )
+    parser.add_argument(
+        "--scale-batch-sizes",
+        default="1,2,4,8,16,32",
+        help="Comma-separated batch sizes for --profile-scale.",
+    )
+    parser.add_argument("--profile-scale-iters", type=int, default=PROFILE_ITERATIONS)
+    parser.add_argument("--profile-scale-warmup", type=int, default=1)
+    parser.add_argument(
+        "--profile-scale-stop-on-oom",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Stop the batch-size sweep after the first CUDA OOM.",
+    )
+    parser.add_argument(
+        "--profile-scale-empty-cache",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Call torch.cuda.empty_cache() between profile-scale batch sizes.",
     )
     parser.add_argument(
         "--sequence",
@@ -304,6 +381,29 @@ def _enable_shared_initial_noise(env: Any) -> None:
     pipe._rlinf_shared_initial_noise_enabled = True
 
 
+def _patch_wan_module_profiler(
+    env: Any, profiler: WanModuleCallProfiler
+):
+    pipe = env.pipe
+    original_model_fn = pipe.model_fn
+    original_vae_decode = pipe.vae.decode
+
+    def profiled_model_fn(*args, **kwargs):
+        return profiler.measure("dit", original_model_fn, *args, **kwargs)
+
+    def profiled_vae_decode(*args, **kwargs):
+        return profiler.measure("vae_decode", original_vae_decode, *args, **kwargs)
+
+    pipe.model_fn = profiled_model_fn
+    pipe.vae.decode = profiled_vae_decode
+
+    def restore() -> None:
+        pipe.model_fn = original_model_fn
+        pipe.vae.decode = original_vae_decode
+
+    return restore
+
+
 def _chunk_step_once(env: Any, policy_output_action: Any, device: torch.device):
     if device.type == "cuda":
         torch.cuda.synchronize()
@@ -332,6 +432,73 @@ def _create_wan_env(cfg, sample_input: dict[str, Any], device: torch.device):
     )
     _restore_env_state(env, sample_input, device)
     return env, num_envs
+
+
+def _source_batch_size_from_wan_input(sample_input: dict[str, Any]) -> int:
+    current_obs = sample_input.get("current_obs")
+    if not isinstance(current_obs, torch.Tensor) or current_obs.ndim == 0:
+        raise ValueError("Wan sample input must contain current_obs with a batch dimension.")
+    return int(current_obs.shape[0])
+
+
+def _scaled_wan_sample_input(
+    sample_input: dict[str, Any],
+    *,
+    source_batch_size: int,
+    target_batch_size: int,
+) -> dict[str, Any]:
+    scaled_input = scale_nested_batch(
+        sample_input,
+        source_batch_size=source_batch_size,
+        target_batch_size=target_batch_size,
+    )
+    scaled_input["group_size"] = int(target_batch_size)
+    return scaled_input
+
+
+def _summarize_wan_module_records(
+    records: list[dict[str, Any]],
+    *,
+    batch_size: int,
+    iterations: int,
+) -> dict[str, Any]:
+    if not records:
+        return {
+            "calls": 0,
+            "calls_per_iteration": 0.0,
+            "elapsed_seconds_total": 0.0,
+            "elapsed_seconds_mean_per_call": None,
+            "elapsed_seconds_min_per_call": None,
+            "elapsed_seconds_max_per_call": None,
+            "elapsed_seconds_mean_per_iteration": 0.0,
+            "latency_per_sample_seconds": 0.0,
+        }
+    timings = [float(record["elapsed_seconds"]) for record in records]
+    summary = {
+        "calls": len(records),
+        "calls_per_iteration": float(len(records) / iterations),
+        "elapsed_seconds_total": float(sum(timings)),
+        "elapsed_seconds_mean_per_call": float(sum(timings) / len(timings)),
+        "elapsed_seconds_min_per_call": float(min(timings)),
+        "elapsed_seconds_max_per_call": float(max(timings)),
+        "elapsed_seconds_mean_per_iteration": float(sum(timings) / iterations),
+        "latency_per_sample_seconds": float(sum(timings) / iterations / batch_size),
+    }
+    allocated = [
+        float(record["peak_memory_allocated_gb"])
+        for record in records
+        if "peak_memory_allocated_gb" in record
+    ]
+    reserved = [
+        float(record["peak_memory_reserved_gb"])
+        for record in records
+        if "peak_memory_reserved_gb" in record
+    ]
+    if allocated:
+        summary["peak_memory_allocated_gb"] = round(max(allocated), 3)
+    if reserved:
+        summary["peak_memory_reserved_gb"] = round(max(reserved), 3)
+    return summary
 
 
 def _warning_messages_for_env(env: Any) -> list[str]:
@@ -617,11 +784,252 @@ def _run_sequence(
     return {"metadata": metadata, "timing": timing, "diff": {}}
 
 
+def _profile_scale_wan_chunk_step(
+    *,
+    args: argparse.Namespace,
+    cfg,
+    sample_input: dict[str, Any],
+    device: torch.device,
+    local_wan_src: Path | None,
+) -> dict[str, Any]:
+    if args.profile_scale_iters <= 0:
+        raise ValueError("--profile-scale-iters must be positive.")
+    if args.profile_scale_warmup < 0:
+        raise ValueError("--profile-scale-warmup must be non-negative.")
+
+    source_batch_size = _source_batch_size_from_wan_input(sample_input)
+    batch_sizes = parse_batch_sizes(args.scale_batch_sizes)
+    results = []
+
+    for batch_size in batch_sizes:
+        if device.type == "cuda" and args.profile_scale_empty_cache:
+            torch.cuda.empty_cache()
+        scaled_input = _scaled_wan_sample_input(
+            sample_input,
+            source_batch_size=source_batch_size,
+            target_batch_size=batch_size,
+        )
+        env = None
+        result: dict[str, Any] = {
+            "batch_size": batch_size,
+            "source_batch_size": source_batch_size,
+            "status": "ok",
+        }
+        try:
+            env, num_envs = _create_wan_env(cfg, scaled_input, device)
+            if args.share_initial_noise:
+                _enable_shared_initial_noise(env)
+            policy_output_action = _normalize_actions(scaled_input["policy_output_action"])
+
+            for _ in range(args.profile_scale_warmup):
+                _restore_env_state(env, scaled_input, device)
+                _chunk_step_once(env, policy_output_action, device)
+
+            reset_cuda_peak_memory(device)
+            timings = []
+            for _ in range(args.profile_scale_iters):
+                _restore_env_state(env, scaled_input, device)
+                *_, elapsed = _chunk_step_once(env, policy_output_action, device)
+                timings.append(elapsed)
+            peak_memory = cuda_memory_snapshot(device)
+
+            result.update(
+                {
+                    "iterations": int(args.profile_scale_iters),
+                    "warmup_iterations": int(args.profile_scale_warmup),
+                    "elapsed_seconds_total": float(sum(timings)),
+                    "elapsed_seconds_mean": float(sum(timings) / len(timings)),
+                    "elapsed_seconds_min": float(min(timings)),
+                    "elapsed_seconds_max": float(max(timings)),
+                    "latency_per_sample_seconds": float(
+                        sum(timings) / len(timings) / batch_size
+                    ),
+                    "num_envs": int(num_envs),
+                    "chunk": int(env.chunk),
+                    "num_inference_steps": int(env.num_inference_steps),
+                    "group_size": int(getattr(env, "group_size", batch_size)),
+                }
+            )
+            if peak_memory is not None:
+                result.update(
+                    {
+                        "peak_memory_allocated_gb": bytes_to_gb(
+                            peak_memory["max_allocated_bytes"]
+                        ),
+                        "peak_memory_reserved_gb": bytes_to_gb(
+                            peak_memory["max_reserved_bytes"]
+                        ),
+                    }
+                )
+        except Exception as exc:
+            if not is_cuda_oom(exc):
+                raise
+            result.update({"status": "oom", "error": str(exc)})
+            results.append(result)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if args.profile_scale_stop_on_oom:
+                break
+            continue
+        finally:
+            del env
+            del scaled_input
+            if device.type == "cuda" and args.profile_scale_empty_cache:
+                torch.cuda.empty_cache()
+
+        results.append(result)
+
+    return {
+        "profile": True,
+        "profile_scale": True,
+        "profile_target": "wan_chunk_step",
+        "batch_sizes": batch_sizes,
+        "source_batch_size": source_batch_size,
+        "iterations": int(args.profile_scale_iters),
+        "warmup_iterations": int(args.profile_scale_warmup),
+        "stop_on_oom": bool(args.profile_scale_stop_on_oom),
+        "empty_cache": bool(args.profile_scale_empty_cache),
+        "share_initial_noise": bool(args.share_initial_noise),
+        "nvtx_enabled": os.environ.get("RLINF_USE_NVTX", "0"),
+        "local_wan_src": str(local_wan_src) if local_wan_src else None,
+        "results": results,
+    }
+
+
+def _profile_scale_wan_modules(
+    *,
+    args: argparse.Namespace,
+    cfg,
+    sample_input: dict[str, Any],
+    device: torch.device,
+    local_wan_src: Path | None,
+) -> dict[str, Any]:
+    if args.profile_scale_iters <= 0:
+        raise ValueError("--profile-scale-iters must be positive.")
+    if args.profile_scale_warmup < 0:
+        raise ValueError("--profile-scale-warmup must be non-negative.")
+
+    source_batch_size = _source_batch_size_from_wan_input(sample_input)
+    batch_sizes = parse_batch_sizes(args.scale_batch_sizes)
+    results = []
+
+    for batch_size in batch_sizes:
+        if device.type == "cuda" and args.profile_scale_empty_cache:
+            torch.cuda.empty_cache()
+        scaled_input = _scaled_wan_sample_input(
+            sample_input,
+            source_batch_size=source_batch_size,
+            target_batch_size=batch_size,
+        )
+        env = None
+        restore_profiler = None
+        result: dict[str, Any] = {
+            "batch_size": batch_size,
+            "source_batch_size": source_batch_size,
+            "status": "ok",
+        }
+        try:
+            env, num_envs = _create_wan_env(cfg, scaled_input, device)
+            if args.share_initial_noise:
+                _enable_shared_initial_noise(env)
+            profiler = WanModuleCallProfiler(device)
+            restore_profiler = _patch_wan_module_profiler(env, profiler)
+            policy_output_action = _normalize_actions(scaled_input["policy_output_action"])
+
+            for _ in range(args.profile_scale_warmup):
+                profiler.clear()
+                _restore_env_state(env, scaled_input, device)
+                _chunk_step_once(env, policy_output_action, device)
+
+            module_records = {
+                "dit": [],
+                "vae_decode": [],
+            }
+            chunk_timings = []
+            for _ in range(args.profile_scale_iters):
+                profiler.clear()
+                _restore_env_state(env, scaled_input, device)
+                *_, elapsed = _chunk_step_once(env, policy_output_action, device)
+                chunk_timings.append(elapsed)
+                for module_name in module_records:
+                    module_records[module_name].extend(profiler.records[module_name])
+
+            result.update(
+                {
+                    "iterations": int(args.profile_scale_iters),
+                    "warmup_iterations": int(args.profile_scale_warmup),
+                    "chunk_step_elapsed_seconds_mean": float(
+                        sum(chunk_timings) / len(chunk_timings)
+                    ),
+                    "chunk_step_latency_per_sample_seconds": float(
+                        sum(chunk_timings) / len(chunk_timings) / batch_size
+                    ),
+                    "num_envs": int(num_envs),
+                    "chunk": int(env.chunk),
+                    "num_inference_steps": int(env.num_inference_steps),
+                    "group_size": int(getattr(env, "group_size", batch_size)),
+                    "modules": {
+                        module_name: _summarize_wan_module_records(
+                            records,
+                            batch_size=batch_size,
+                            iterations=int(args.profile_scale_iters),
+                        )
+                        for module_name, records in module_records.items()
+                    },
+                }
+            )
+        except Exception as exc:
+            if not is_cuda_oom(exc):
+                raise
+            result.update({"status": "oom", "error": str(exc)})
+            results.append(result)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            if args.profile_scale_stop_on_oom:
+                break
+            continue
+        finally:
+            if restore_profiler is not None:
+                restore_profiler()
+            del env
+            del scaled_input
+            if device.type == "cuda" and args.profile_scale_empty_cache:
+                torch.cuda.empty_cache()
+
+        results.append(result)
+
+    return {
+        "profile": True,
+        "profile_scale": True,
+        "profile_scale_modules": True,
+        "profile_target": "wan_modules",
+        "modules": ["dit", "vae_decode"],
+        "batch_sizes": batch_sizes,
+        "source_batch_size": source_batch_size,
+        "iterations": int(args.profile_scale_iters),
+        "warmup_iterations": int(args.profile_scale_warmup),
+        "stop_on_oom": bool(args.profile_scale_stop_on_oom),
+        "empty_cache": bool(args.profile_scale_empty_cache),
+        "share_initial_noise": bool(args.share_initial_noise),
+        "nvtx_enabled": os.environ.get("RLINF_USE_NVTX", "0"),
+        "local_wan_src": str(local_wan_src) if local_wan_src else None,
+        "results": results,
+    }
+
+
 def run_slice(args: argparse.Namespace) -> dict[str, Any]:
     if args.profile and args.sequence:
         raise ValueError("--sequence cannot be combined with --profile.")
     if args.profile and args.dump_dit_residuals:
         raise ValueError("--dump-dit-residuals cannot be combined with --profile.")
+    if args.profile and args.profile_scale:
+        raise ValueError("--profile and --profile-scale are mutually exclusive.")
+    if args.profile_scale_modules and not args.profile_scale:
+        raise ValueError("--profile-scale-modules requires --profile-scale.")
+    if args.profile_scale and args.sequence:
+        raise ValueError("--sequence cannot be combined with --profile-scale.")
+    if args.profile_scale and args.dump_dit_residuals:
+        raise ValueError("--dump-dit-residuals cannot be combined with --profile-scale.")
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -632,10 +1040,10 @@ def run_slice(args: argparse.Namespace) -> dict[str, Any]:
         overrides=args.override,
     )
     sample = load_slice_sample(args.sample_path, expected_kind="acwm")
-    if args.profile:
+    if args.profile or args.profile_scale:
         os.environ.setdefault("RLINF_USE_NVTX", "1")
     elif args.output_dir is None:
-        raise ValueError("--output-dir is required unless --profile is enabled")
+        raise ValueError("--output-dir is required unless --profile/--profile-scale is enabled")
     output_dir = reset_export_dir(args.output_dir) if args.output_dir is not None else None
     sample_input = sample["payload"]["input"]
     reference = sample["payload"].get("output", {})
@@ -648,6 +1056,25 @@ def run_slice(args: argparse.Namespace) -> dict[str, Any]:
         if args.dump_dit_residuals
         else None
     )
+
+    if args.profile_scale:
+        if args.profile_scale_modules:
+            timing = _profile_scale_wan_modules(
+                args=args,
+                cfg=cfg,
+                sample_input=sample_input,
+                device=device,
+                local_wan_src=local_wan_src,
+            )
+            return {"metadata": {}, "timing": timing, "diff": {}}
+        timing = _profile_scale_wan_chunk_step(
+            args=args,
+            cfg=cfg,
+            sample_input=sample_input,
+            device=device,
+            local_wan_src=local_wan_src,
+        )
+        return {"metadata": {}, "timing": timing, "diff": {}}
 
     if args.sequence:
         return _run_sequence(
