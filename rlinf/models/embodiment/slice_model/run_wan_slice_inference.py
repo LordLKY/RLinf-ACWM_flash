@@ -35,6 +35,7 @@ from rlinf.models.embodiment.slice_model.common import (
     is_cuda_oom,
     load_hydra_config,
     load_slice_sample,
+    nested_diff_summary,
     parse_batch_sizes,
     prepend_local_src,
     repo_root,
@@ -243,6 +244,27 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--profile-prefix-step",
+        action="store_true",
+        help=(
+            "Run one Wan prefix-step quality experiment: baseline full-batch denoise "
+            "and one prefix run whose first --prefix-steps denoise steps share the "
+            "reference batch lane's generated latents."
+        ),
+    )
+    parser.add_argument(
+        "--prefix-steps",
+        type=int,
+        default=1,
+        help="Number of initial Wan denoise steps to run with a shared prefix.",
+    )
+    parser.add_argument(
+        "--prefix-reference-batch-id",
+        type=int,
+        default=0,
+        help="Batch lane used as the shared denoise prefix representative.",
+    )
+    parser.add_argument(
         "--dit-residual-dir",
         default=DEFAULT_DIT_RESIDUAL_DIR,
         type=Path,
@@ -379,6 +401,18 @@ def _enable_shared_initial_noise(env: Any) -> None:
 
     pipe.generate_noise = generate_shared_noise
     pipe._rlinf_shared_initial_noise_enabled = True
+
+
+def _set_wan_prefix_steps(env: Any, *, prefix_steps: int, reference_batch_id: int) -> None:
+    pipe = env.pipe
+    pipe._rlinf_prefix_steps = int(prefix_steps)
+    pipe._rlinf_prefix_reference_batch_id = int(reference_batch_id)
+
+
+def _clear_wan_prefix_steps(env: Any) -> None:
+    pipe = env.pipe
+    pipe._rlinf_prefix_steps = 0
+    pipe._rlinf_prefix_reference_batch_id = 0
 
 
 def _patch_wan_module_profiler(
@@ -574,6 +608,265 @@ def _export_acwm_chunk(
         reset_export_dir(output_dir / "reference_output"),
         save_current_obs_frames=save_output_current_obs_frames,
     )
+
+
+def _quality_compare_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "current_obs",
+        "extracted_obs",
+        "chunk_rewards_tensors",
+        "chunk_terminations",
+        "chunk_truncations",
+        "past_dones",
+    )
+    return {key: payload[key] for key in keys if key in payload}
+
+
+def _image_diff_by_env(pred: Any, ref: Any) -> dict[str, Any]:
+    pred_tensor = torch.as_tensor(pred).detach().cpu().to(torch.float32)
+    ref_tensor = torch.as_tensor(ref).detach().cpu().to(torch.float32)
+    if tuple(pred_tensor.shape) != tuple(ref_tensor.shape):
+        return {
+            "comparable": False,
+            "reason": "shape_mismatch",
+            "pred_shape": list(pred_tensor.shape),
+            "ref_shape": list(ref_tensor.shape),
+        }
+    if pred_tensor.ndim == 0:
+        return {"comparable": False, "reason": "scalar_input"}
+    diff = pred_tensor - ref_tensor
+    flat = diff.reshape(diff.shape[0], -1)
+    abs_flat = flat.abs()
+    rmse = torch.sqrt((flat * flat).mean(dim=1))
+    per_env = [
+        {
+            "env_id": int(env_id),
+            "mean_abs": float(abs_flat[env_id].mean().item()),
+            "rmse": float(rmse[env_id].item()),
+            "max_abs": float(abs_flat[env_id].max().item()),
+        }
+        for env_id in range(flat.shape[0])
+    ]
+    return {
+        "comparable": True,
+        "shape": list(pred_tensor.shape),
+        "overall": {
+            "mean_abs": float(abs_flat.mean().item()),
+            "rmse": float(torch.sqrt((diff * diff).mean()).item()),
+            "max_abs": float(abs_flat.max().item()),
+        },
+        "per_env": per_env,
+    }
+
+
+def _main_images_diff_by_env(predicted: dict[str, Any], reference: dict[str, Any]) -> dict[str, Any]:
+    pred_images = predicted.get("extracted_obs", {}).get("main_images")
+    ref_images = reference.get("extracted_obs", {}).get("main_images")
+    if pred_images is None or ref_images is None:
+        return {
+            "comparable": False,
+            "reason": "missing_extracted_obs_main_images",
+        }
+    return _image_diff_by_env(pred_images, ref_images)
+
+
+def _prefix_quality_summary(
+    *,
+    timing: dict[str, Any],
+    prefix: dict[str, Any],
+    baseline: dict[str, Any],
+    reference: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "timing": {
+            "prefix_steps": timing["prefix_steps"],
+            "prefix_reference_batch_id": timing["prefix_reference_batch_id"],
+            "batch_size": timing["batch_size"],
+            "num_inference_steps": timing["num_inference_steps"],
+            "baseline_elapsed_seconds": timing["baseline_elapsed_seconds"],
+            "prefix_elapsed_seconds": timing["prefix_elapsed_seconds"],
+            "prefix_speedup_vs_baseline": timing["prefix_speedup_vs_baseline"],
+        },
+        "final_image_diff": {
+            "prefix_vs_baseline": _main_images_diff_by_env(prefix, baseline),
+            "prefix_vs_reference": _main_images_diff_by_env(prefix, reference),
+            "baseline_vs_reference": _main_images_diff_by_env(baseline, reference),
+        },
+    }
+
+
+def _format_image_diff_summary(title: str, diff: dict[str, Any]) -> list[str]:
+    if not diff.get("comparable"):
+        return [f"{title}: not comparable ({diff.get('reason', 'unknown')})"]
+    overall = diff["overall"]
+    lines = [
+        f"{title}:",
+        f"  overall MAE  = {overall['mean_abs']:.6g} px",
+        f"  overall RMSE = {overall['rmse']:.6g} px",
+        f"  overall max  = {overall['max_abs']:.6g} px",
+        "  per env MAE/RMSE/max:",
+    ]
+    for item in diff["per_env"]:
+        lines.append(
+            "    env{env_id}: {mean_abs:.6g} / {rmse:.6g} / {max_abs:.6g}".format(
+                **item
+            )
+        )
+    return lines
+
+
+def _write_prefix_quality_summary(summary: dict[str, Any], output_dir: Path) -> None:
+    save_json(summary, output_dir / "summary.json")
+    timing = summary["timing"]
+    lines = [
+        "Wan prefix-step quality summary",
+        "",
+        f"prefix_steps: {timing['prefix_steps']}",
+        f"prefix_reference_batch_id: {timing['prefix_reference_batch_id']}",
+        f"batch_size: {timing['batch_size']}",
+        f"num_inference_steps: {timing['num_inference_steps']}",
+        f"baseline_elapsed_seconds: {timing['baseline_elapsed_seconds']:.6g}",
+        f"prefix_elapsed_seconds: {timing['prefix_elapsed_seconds']:.6g}",
+        f"prefix_speedup_vs_baseline: {timing['prefix_speedup_vs_baseline']:.6g}",
+        "",
+    ]
+    image_diff = summary["final_image_diff"]
+    lines.extend(
+        _format_image_diff_summary(
+            "prefix_vs_baseline final image", image_diff["prefix_vs_baseline"]
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _format_image_diff_summary(
+            "prefix_vs_reference final image", image_diff["prefix_vs_reference"]
+        )
+    )
+    lines.append("")
+    lines.extend(
+        _format_image_diff_summary(
+            "baseline_vs_reference final image", image_diff["baseline_vs_reference"]
+        )
+    )
+    summary_path = output_dir / "summary.txt"
+    summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _profile_prefix_step_quality(
+    *,
+    args: argparse.Namespace,
+    cfg,
+    sample: dict[str, Any],
+    sample_input: dict[str, Any],
+    reference: dict[str, Any],
+    device: torch.device,
+    output_dir: Path,
+    local_wan_src: Path | None,
+) -> dict[str, Any]:
+    if args.prefix_steps < 0:
+        raise ValueError("--prefix-steps must be non-negative.")
+
+    env, num_envs = _create_wan_env(cfg, sample_input, device)
+    if args.prefix_reference_batch_id < 0 or args.prefix_reference_batch_id >= num_envs:
+        raise ValueError(
+            f"--prefix-reference-batch-id={args.prefix_reference_batch_id} is outside batch size {num_envs}."
+        )
+
+    _enable_shared_initial_noise(env)
+    warning_messages = _warning_messages_for_env(env)
+    if not args.share_initial_noise:
+        warning_messages.append(
+            "--profile-prefix-step enabled shared initial noise for a fair baseline/prefix comparison."
+        )
+
+    _clear_wan_prefix_steps(env)
+    _restore_env_state(env, sample_input, device)
+    baseline, baseline_elapsed = _run_one_chunk(env, sample_input, device)
+
+    _restore_env_state(env, sample_input, device)
+    _set_wan_prefix_steps(
+        env,
+        prefix_steps=args.prefix_steps,
+        reference_batch_id=args.prefix_reference_batch_id,
+    )
+    try:
+        prefix, prefix_elapsed = _run_one_chunk(env, sample_input, device)
+    finally:
+        _clear_wan_prefix_steps(env)
+
+    baseline_dir = output_dir / "baseline"
+    prefix_dir = output_dir / f"prefix_steps_{args.prefix_steps:02d}"
+    _export_acwm_chunk(
+        sample_input=sample_input,
+        predicted=baseline,
+        reference=reference,
+        output_dir=baseline_dir,
+        save_pt_outputs=args.save_pt,
+        save_output_current_obs_frames=args.save_output_current_obs_frames,
+        save_input_current_obs_frames=True,
+    )
+    _export_acwm_chunk(
+        sample_input=sample_input,
+        predicted=prefix,
+        reference=reference,
+        output_dir=prefix_dir,
+        save_pt_outputs=args.save_pt,
+        save_output_current_obs_frames=args.save_output_current_obs_frames,
+        save_input_current_obs_frames=True,
+    )
+
+    baseline_payload = _quality_compare_payload(baseline)
+    prefix_payload = _quality_compare_payload(prefix)
+    reference_payload = _quality_compare_payload(reference)
+    diff = {
+        "prefix_vs_baseline": nested_diff_summary(prefix_payload, baseline_payload),
+        "prefix_vs_reference": nested_diff_summary(prefix_payload, reference_payload)
+        if reference_payload
+        else {},
+        "baseline_vs_reference": nested_diff_summary(baseline_payload, reference_payload)
+        if reference_payload
+        else {},
+    }
+
+    timing = {
+        "profile_prefix_step": True,
+        "prefix_steps": int(args.prefix_steps),
+        "prefix_reference_batch_id": int(args.prefix_reference_batch_id),
+        "batch_size": num_envs,
+        "chunk": int(env.chunk),
+        "num_inference_steps": int(env.num_inference_steps),
+        "shared_initial_noise": True,
+        "baseline_elapsed_seconds": float(baseline_elapsed),
+        "prefix_elapsed_seconds": float(prefix_elapsed),
+        "prefix_speedup_vs_baseline": float(baseline_elapsed / prefix_elapsed)
+        if prefix_elapsed > 0
+        else None,
+        "baseline_dir": str(baseline_dir),
+        "prefix_dir": str(prefix_dir),
+        "local_wan_src": str(local_wan_src) if local_wan_src else None,
+    }
+    metadata = {
+        "sample_path": str(args.sample_path),
+        "sample_metadata": sample["metadata"],
+        "config_name": args.config_name,
+        "config_dir": str(args.config_dir) if args.config_dir else None,
+        "overrides": args.override,
+        "device": str(device),
+        "local_wan_src": str(local_wan_src) if local_wan_src else None,
+        "num_envs": num_envs,
+        "warnings": warning_messages,
+    }
+    summary = _prefix_quality_summary(
+        timing=timing,
+        prefix=prefix,
+        baseline=baseline,
+        reference=reference,
+    )
+    save_json(timing, output_dir / "timing.json")
+    save_json(metadata, output_dir / "metadata.json")
+    save_json(diff, output_dir / "diff.json")
+    _write_prefix_quality_summary(summary, output_dir)
+    return {"metadata": metadata, "timing": timing, "diff": diff}
 
 
 def _sequence_sort_key(record: dict[str, Any]) -> tuple[int, int, str]:
@@ -1030,6 +1323,13 @@ def run_slice(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--sequence cannot be combined with --profile-scale.")
     if args.profile_scale and args.dump_dit_residuals:
         raise ValueError("--dump-dit-residuals cannot be combined with --profile-scale.")
+    if args.profile_prefix_step and (
+        args.profile or args.profile_scale or args.sequence or args.dump_dit_residuals
+    ):
+        raise ValueError(
+            "--profile-prefix-step cannot be combined with --profile, --profile-scale, "
+            "--sequence, or --dump-dit-residuals."
+        )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -1043,7 +1343,9 @@ def run_slice(args: argparse.Namespace) -> dict[str, Any]:
     if args.profile or args.profile_scale:
         os.environ.setdefault("RLINF_USE_NVTX", "1")
     elif args.output_dir is None:
-        raise ValueError("--output-dir is required unless --profile/--profile-scale is enabled")
+        raise ValueError(
+            "--output-dir is required unless --profile/--profile-scale is enabled"
+        )
     output_dir = reset_export_dir(args.output_dir) if args.output_dir is not None else None
     sample_input = sample["payload"]["input"]
     reference = sample["payload"].get("output", {})
@@ -1075,6 +1377,18 @@ def run_slice(args: argparse.Namespace) -> dict[str, Any]:
             local_wan_src=local_wan_src,
         )
         return {"metadata": {}, "timing": timing, "diff": {}}
+
+    if args.profile_prefix_step:
+        return _profile_prefix_step_quality(
+            args=args,
+            cfg=cfg,
+            sample=sample,
+            sample_input=sample_input,
+            reference=reference,
+            device=device,
+            output_dir=output_dir,
+            local_wan_src=local_wan_src,
+        )
 
     if args.sequence:
         return _run_sequence(

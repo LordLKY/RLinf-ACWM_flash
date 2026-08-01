@@ -45,6 +45,43 @@ def set_dit_step_recorder(recorder):
     _DIT_STEP_RECORDER = recorder
 
 
+def _rlinf_slice_batch_value(value, batch_size, batch_index):
+    if isinstance(value, torch.Tensor) and value.dim() > 0 and value.shape[0] == batch_size:
+        return value[batch_index : batch_index + 1]
+    if isinstance(value, np.ndarray) and value.ndim > 0 and value.shape[0] == batch_size:
+        return value[batch_index : batch_index + 1]
+    if isinstance(value, list) and len(value) == batch_size:
+        return [value[batch_index]]
+    if isinstance(value, tuple) and len(value) == batch_size:
+        return (value[batch_index],)
+    if isinstance(value, dict):
+        return {
+            key: _rlinf_slice_batch_value(item, batch_size, batch_index)
+            for key, item in value.items()
+        }
+    return value
+
+
+def _rlinf_slice_batch_inputs(inputs, batch_size, batch_index):
+    sliced = {
+        key: _rlinf_slice_batch_value(value, batch_size, batch_index)
+        for key, value in inputs.items()
+    }
+    if "batch_size" in sliced:
+        sliced["batch_size"] = 1
+    return sliced
+
+
+def _rlinf_reapply_clean_context_latents(inputs_shared):
+    if "first_frame_latents" not in inputs_shared:
+        return
+    ff = inputs_shared["first_frame_latents"]
+    if ff.dim() == 4:
+        ff = ff.unsqueeze(0)
+    T0 = ff.shape[2]
+    inputs_shared["latents"][:, :, :T0] = ff
+
+
 class L1AnalysisCollector:
     """一个用于在推理过程中收集数据并计算相对L1距离的辅助类。"""
     def __init__(self):
@@ -697,6 +734,9 @@ class WanVideoPipeline(BasePipeline):
         # B
         batch_size: Optional[int] = None, 
         bs_1: bool = True,
+        # RLinf slice-only prefix sharing experiment.
+        prefix_steps: Optional[int] = None,
+        prefix_reference_batch_id: int = 0,
     ):
 
 
@@ -751,6 +791,24 @@ class WanVideoPipeline(BasePipeline):
         for unit in self.units:
             inputs_shared, inputs_posi, inputs_nega = self.unit_runner(unit, self, inputs_shared, inputs_posi, inputs_nega)
 
+        if prefix_steps is None:
+            prefix_steps = getattr(self, "_rlinf_prefix_steps", 0)
+        if prefix_reference_batch_id is None:
+            prefix_reference_batch_id = getattr(self, "_rlinf_prefix_reference_batch_id", 0)
+        else:
+            prefix_reference_batch_id = getattr(
+                self, "_rlinf_prefix_reference_batch_id", prefix_reference_batch_id
+            )
+        prefix_steps = max(0, int(prefix_steps or 0))
+        prefix_reference_batch_id = int(prefix_reference_batch_id)
+        prefix_batch_size = int(inputs_shared["latents"].shape[0])
+        if prefix_steps > 0:
+            if cfg_scale != 1.0:
+                raise NotImplementedError("RLinf prefix-step profiling currently supports cfg_scale=1.0 only.")
+            if prefix_reference_batch_id < 0 or prefix_reference_batch_id >= prefix_batch_size:
+                raise ValueError(
+                    f"prefix_reference_batch_id={prefix_reference_batch_id} is outside batch size {prefix_batch_size}."
+                )
 
         # Denoise
         self.load_models_to_device(self.in_iteration_models)
@@ -771,6 +829,28 @@ class WanVideoPipeline(BasePipeline):
                 _DIT_STEP_RECORDER.begin_step(progress_id, timestep)
 
             # Inference
+            if prefix_steps > 0 and prefix_batch_size > 1 and progress_id < prefix_steps:
+                prefix_inputs_shared = _rlinf_slice_batch_inputs(
+                    inputs_shared, prefix_batch_size, prefix_reference_batch_id
+                )
+                prefix_inputs_posi = _rlinf_slice_batch_inputs(
+                    inputs_posi, prefix_batch_size, prefix_reference_batch_id
+                )
+                noise_pred = self.model_fn(
+                    **models,
+                    **prefix_inputs_shared,
+                    **prefix_inputs_posi,
+                    timestep=timestep,
+                )
+                prefix_latents = self.scheduler.step(
+                    noise_pred,
+                    self.scheduler.timesteps[progress_id],
+                    prefix_inputs_shared["latents"],
+                )
+                inputs_shared["latents"] = prefix_latents.expand_as(inputs_shared["latents"]).clone()
+                _rlinf_reapply_clean_context_latents(inputs_shared)
+                continue
+
             noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
   
             if cfg_scale != 1.0:
@@ -786,14 +866,7 @@ class WanVideoPipeline(BasePipeline):
             # Scheduler
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
       
-            if "first_frame_latents" in inputs_shared:
-                ff = inputs_shared["first_frame_latents"]   # [C, T0, H, W] 或 [B, C, T0, H, W]
-                if ff.dim() == 4:
-                    ff = ff.unsqueeze(0)  # -> [1, C, T0, H, W]
-
-                T0 = ff.shape[2]
-
-                inputs_shared["latents"][:, :, :T0] = ff
+            _rlinf_reapply_clean_context_latents(inputs_shared)
         
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):
