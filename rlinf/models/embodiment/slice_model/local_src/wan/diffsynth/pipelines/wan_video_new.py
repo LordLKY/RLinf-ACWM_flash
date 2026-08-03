@@ -38,11 +38,17 @@ import seaborn as sns
 
 
 _DIT_STEP_RECORDER = None
+_MIDDLE_RESULT_RECORDER = None
 
 
 def set_dit_step_recorder(recorder):
     global _DIT_STEP_RECORDER
     _DIT_STEP_RECORDER = recorder
+
+
+def set_middle_result_recorder(recorder):
+    global _MIDDLE_RESULT_RECORDER
+    _MIDDLE_RESULT_RECORDER = recorder
 
 
 def _rlinf_slice_batch_value(value, batch_size, batch_index):
@@ -80,6 +86,11 @@ def _rlinf_reapply_clean_context_latents(inputs_shared):
         ff = ff.unsqueeze(0)
     T0 = ff.shape[2]
     inputs_shared["latents"][:, :, :T0] = ff
+
+
+def _rlinf_record_middle_result(step_index, timestep, latents):
+    if _MIDDLE_RESULT_RECORDER is not None:
+        _MIDDLE_RESULT_RECORDER.save_latents(step_index, timestep, latents)
 
 
 class L1AnalysisCollector:
@@ -849,6 +860,11 @@ class WanVideoPipeline(BasePipeline):
                 )
                 inputs_shared["latents"] = prefix_latents.expand_as(inputs_shared["latents"]).clone()
                 _rlinf_reapply_clean_context_latents(inputs_shared)
+                _rlinf_record_middle_result(
+                    progress_id,
+                    self.scheduler.timesteps[progress_id],
+                    inputs_shared["latents"],
+                )
                 continue
 
             noise_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, timestep=timestep)
@@ -867,6 +883,11 @@ class WanVideoPipeline(BasePipeline):
             inputs_shared["latents"] = self.scheduler.step(noise_pred, self.scheduler.timesteps[progress_id], inputs_shared["latents"])
       
             _rlinf_reapply_clean_context_latents(inputs_shared)
+            _rlinf_record_middle_result(
+                progress_id,
+                self.scheduler.timesteps[progress_id],
+                inputs_shared["latents"],
+            )
         
         # VACE (TODO: remove it)
         if vace_reference_image is not None or (animate_pose_video is not None and animate_face_video is not None):

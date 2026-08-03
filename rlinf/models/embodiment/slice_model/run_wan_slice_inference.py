@@ -25,6 +25,7 @@ from typing import Any
 import numpy as np
 import torch
 from omegaconf import OmegaConf, open_dict
+from PIL import Image, ImageDraw
 
 from rlinf.models.embodiment.slice_model.common import (
     bytes_to_gb,
@@ -42,6 +43,7 @@ from rlinf.models.embodiment.slice_model.common import (
     reset_export_dir,
     reset_cuda_peak_memory,
     save_json,
+    save_image,
     save_pt,
     scale_nested_batch,
     tensor_diff_summary,
@@ -52,6 +54,7 @@ from rlinf.utils.utils import nvtx_range
 
 PROFILE_ITERATIONS = 10
 DEFAULT_DIT_RESIDUAL_DIR = repo_root() / "profile" / "wan_slice" / "dit_residual"
+DEFAULT_MIDDLE_RESULT_DIR = repo_root() / "profile" / "wan_slice" / "middle_result"
 
 
 class DitResidualRecorder:
@@ -73,6 +76,25 @@ class DitResidualRecorder:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(residual.detach().to(device="cpu", dtype=torch.float32), output_path)
         self.saved_steps.add(self.step_index)
+
+
+class WanMiddleResultRecorder:
+    def __init__(self):
+        self.records: list[dict[str, Any]] = []
+
+    def save_latents(self, step_index: int, timestep: torch.Tensor, latents: torch.Tensor) -> None:
+        timestep_value = (
+            timestep.detach().cpu().flatten().tolist()
+            if isinstance(timestep, torch.Tensor)
+            else timestep
+        )
+        self.records.append(
+            {
+                "step_index": int(step_index),
+                "timestep": timestep_value,
+                "latents": latents.detach().to(device="cpu").clone(),
+            }
+        )
 
 
 class WanModuleCallProfiler:
@@ -118,6 +140,12 @@ def _set_dit_step_recorder(recorder: DitResidualRecorder | None) -> None:
     from diffsynth.pipelines.wan_video_new import set_dit_step_recorder
 
     set_dit_step_recorder(recorder)
+
+
+def _set_middle_result_recorder(recorder: WanMiddleResultRecorder | None) -> None:
+    from diffsynth.pipelines.wan_video_new import set_middle_result_recorder
+
+    set_middle_result_recorder(recorder)
 
 
 def _reset_dit_residual_output_dir(output_dir: str | Path) -> Path:
@@ -263,6 +291,37 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Batch lane used as the shared denoise prefix representative.",
+    )
+    parser.add_argument(
+        "--profile-middle-result",
+        action="store_true",
+        help=(
+            "Record Wan latents after each denoise step and decode them after "
+            "the chunk to visualize progressive denoising."
+        ),
+    )
+    parser.add_argument(
+        "--middle-result-dir",
+        default=DEFAULT_MIDDLE_RESULT_DIR,
+        type=Path,
+        help="Directory for --profile-middle-result decoded step frames.",
+    )
+    parser.add_argument(
+        "--middle-result-save-latents",
+        action="store_true",
+        help="Also save each denoise-step latent as .pt under --middle-result-dir.",
+    )
+    parser.add_argument(
+        "--middle-result-generated-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Only export generated frames after the clean context window.",
+    )
+    parser.add_argument(
+        "--middle-result-max-envs",
+        type=int,
+        default=8,
+        help="Maximum batch lanes to decode/export for --profile-middle-result.",
     )
     parser.add_argument(
         "--dit-residual-dir",
@@ -752,6 +811,152 @@ def _write_prefix_quality_summary(summary: dict[str, Any], output_dir: Path) -> 
     summary_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _decode_middle_latents(env: Any, latents: torch.Tensor) -> torch.Tensor:
+    pipe = env.pipe
+    with torch.no_grad(), nvtx_range("slice/wan_middle_result/vae_decode"):
+        videos = pipe.vae.decode(
+            latents,
+            device=pipe.device,
+            tiled=False,
+            tile_size=(30, 52),
+            tile_stride=(15, 26),
+        )
+    videos = videos.detach().cpu()
+    if videos.ndim == 4:
+        videos = videos.unsqueeze(0)
+    if videos.ndim != 5:
+        raise ValueError(f"Unexpected decoded Wan video tensor shape: {tuple(videos.shape)}")
+    return videos
+
+
+def _make_middle_result_montage(
+    *,
+    chunk_dir: Path,
+    env_id: int,
+    frame_indices: list[int],
+    step_indices: list[int],
+) -> None:
+    if not frame_indices or not step_indices:
+        return
+    thumb_size = 96
+    label_h = 22
+    label_w = 64
+    width = label_w + len(frame_indices) * thumb_size
+    height = label_h + len(step_indices) * (thumb_size + label_h)
+    canvas = Image.new("RGB", (width, height), "white")
+    draw = ImageDraw.Draw(canvas)
+    for col, frame_id in enumerate(frame_indices):
+        draw.text((label_w + col * thumb_size + 4, 4), f"f{frame_id}", fill="black")
+    for row, step_id in enumerate(step_indices):
+        y = label_h + row * (thumb_size + label_h)
+        draw.text((4, y + 4), f"step{step_id}", fill="black")
+        step_dir = chunk_dir / f"step_{step_id:06d}"
+        for col, frame_id in enumerate(frame_indices):
+            image_path = step_dir / f"env{env_id:03d}_frame{frame_id:03d}.png"
+            if not image_path.exists():
+                continue
+            image = Image.open(image_path).convert("RGB").resize(
+                (thumb_size, thumb_size)
+            )
+            canvas.paste(image, (label_w + col * thumb_size, y))
+    montage_dir = chunk_dir / "montage"
+    montage_dir.mkdir(parents=True, exist_ok=True)
+    canvas.save(montage_dir / f"env{env_id:03d}.jpg", quality=95)
+
+
+def _export_middle_results(
+    *,
+    env: Any,
+    recorder: WanMiddleResultRecorder,
+    sample: dict[str, Any],
+    sample_path: Path,
+    output_root: Path,
+    save_latents: bool,
+    generated_only: bool,
+    max_envs: int,
+) -> dict[str, Any]:
+    if not recorder.records:
+        raise RuntimeError("No Wan middle-result latents were recorded.")
+    if max_envs <= 0:
+        raise ValueError("--middle-result-max-envs must be positive.")
+
+    sample_index = int(sample["metadata"].get("sample_index", 0))
+    chunk_dir = reset_export_dir(
+        Path(output_root).expanduser().resolve() / f"chunk_{sample_index:06d}"
+    )
+    latents_dir = chunk_dir / "latents"
+    max_envs_seen = 0
+    frame_indices: list[int] = []
+    step_indices: list[int] = []
+    record_summaries = []
+    context_frames = int(getattr(env, "condition_frame_length", 0))
+
+    env.pipe.load_models_to_device(["vae"])
+    try:
+        for record in recorder.records:
+            step_id = int(record["step_index"])
+            step_indices.append(step_id)
+            latents = record["latents"]
+            env_count = min(int(latents.shape[0]), int(max_envs))
+            max_envs_seen = max(max_envs_seen, env_count)
+            latents = latents[:env_count]
+            if save_latents:
+                latents_dir.mkdir(parents=True, exist_ok=True)
+                torch.save(
+                    latents.detach().cpu().to(torch.float32),
+                    latents_dir / f"step_{step_id:06d}.pt",
+                )
+
+            videos = _decode_middle_latents(env, latents)
+            total_frames = int(videos.shape[2])
+            frame_start = min(context_frames, total_frames) if generated_only else 0
+            current_frame_indices = list(range(frame_start, total_frames))
+            if not frame_indices:
+                frame_indices = current_frame_indices
+
+            step_dir = chunk_dir / f"step_{step_id:06d}"
+            step_dir.mkdir(parents=True, exist_ok=True)
+            for env_id in range(env_count):
+                for frame_id in current_frame_indices:
+                    save_image(
+                        videos[env_id, :, frame_id],
+                        step_dir / f"env{env_id:03d}_frame{frame_id:03d}.png",
+                    )
+            record_summaries.append(
+                {
+                    "step_index": step_id,
+                    "timestep": record["timestep"],
+                    "latent_shape": list(record["latents"].shape),
+                    "decoded_shape": list(videos.shape),
+                    "saved_envs": env_count,
+                    "saved_frame_indices": current_frame_indices,
+                }
+            )
+    finally:
+        env.pipe.load_models_to_device([])
+
+    unique_step_indices = sorted(set(step_indices))
+    for env_id in range(max_envs_seen):
+        _make_middle_result_montage(
+            chunk_dir=chunk_dir,
+            env_id=env_id,
+            frame_indices=frame_indices,
+            step_indices=unique_step_indices,
+        )
+
+    metadata = {
+        "sample_path": str(sample_path),
+        "sample_metadata": sample["metadata"],
+        "chunk_dir": str(chunk_dir),
+        "save_latents": bool(save_latents),
+        "generated_only": bool(generated_only),
+        "context_frames": context_frames,
+        "records": record_summaries,
+    }
+    save_json(metadata, chunk_dir / "metadata.json")
+    return metadata
+
+
 def _profile_prefix_step_quality(
     *,
     args: argparse.Namespace,
@@ -867,6 +1072,80 @@ def _profile_prefix_step_quality(
     save_json(diff, output_dir / "diff.json")
     _write_prefix_quality_summary(summary, output_dir)
     return {"metadata": metadata, "timing": timing, "diff": diff}
+
+
+def _profile_middle_result(
+    *,
+    args: argparse.Namespace,
+    cfg,
+    sample: dict[str, Any],
+    sample_input: dict[str, Any],
+    reference: dict[str, Any],
+    device: torch.device,
+    output_dir: Path,
+    local_wan_src: Path | None,
+) -> dict[str, Any]:
+    env, num_envs = _create_wan_env(cfg, sample_input, device)
+    if args.share_initial_noise:
+        _enable_shared_initial_noise(env)
+    warning_messages = _warning_messages_for_env(env)
+
+    recorder = WanMiddleResultRecorder()
+    _set_middle_result_recorder(recorder)
+    try:
+        predicted, elapsed = _run_one_chunk(env, sample_input, device)
+    finally:
+        _set_middle_result_recorder(None)
+
+    _export_acwm_chunk(
+        sample_input=sample_input,
+        predicted=predicted,
+        reference=reference,
+        output_dir=output_dir,
+        save_pt_outputs=args.save_pt,
+        save_output_current_obs_frames=args.save_output_current_obs_frames,
+        save_input_current_obs_frames=True,
+    )
+    middle_metadata = _export_middle_results(
+        env=env,
+        recorder=recorder,
+        sample=sample,
+        sample_path=args.sample_path,
+        output_root=args.middle_result_dir,
+        save_latents=args.middle_result_save_latents,
+        generated_only=args.middle_result_generated_only,
+        max_envs=args.middle_result_max_envs,
+    )
+
+    timing = {
+        "profile_middle_result": True,
+        "elapsed_seconds": float(elapsed),
+        "batch_size": num_envs,
+        "chunk": int(env.chunk),
+        "num_inference_steps": int(env.num_inference_steps),
+        "recorded_steps": len(recorder.records),
+        "middle_result_dir": middle_metadata["chunk_dir"],
+        "middle_result_generated_only": bool(args.middle_result_generated_only),
+        "middle_result_save_latents": bool(args.middle_result_save_latents),
+        "middle_result_max_envs": int(args.middle_result_max_envs),
+        "share_initial_noise": bool(args.share_initial_noise),
+        "local_wan_src": str(local_wan_src) if local_wan_src else None,
+    }
+    metadata = {
+        "sample_path": str(args.sample_path),
+        "sample_metadata": sample["metadata"],
+        "config_name": args.config_name,
+        "config_dir": str(args.config_dir) if args.config_dir else None,
+        "overrides": args.override,
+        "device": str(device),
+        "local_wan_src": str(local_wan_src) if local_wan_src else None,
+        "num_envs": num_envs,
+        "middle_result": middle_metadata,
+        "warnings": warning_messages,
+    }
+    save_json(timing, output_dir / "timing.json")
+    save_json(metadata, output_dir / "metadata.json")
+    return {"metadata": metadata, "timing": timing, "diff": {}}
 
 
 def _sequence_sort_key(record: dict[str, Any]) -> tuple[int, int, str]:
@@ -1330,6 +1609,17 @@ def run_slice(args: argparse.Namespace) -> dict[str, Any]:
             "--profile-prefix-step cannot be combined with --profile, --profile-scale, "
             "--sequence, or --dump-dit-residuals."
         )
+    if args.profile_middle_result and (
+        args.profile
+        or args.profile_scale
+        or args.sequence
+        or args.dump_dit_residuals
+        or args.profile_prefix_step
+    ):
+        raise ValueError(
+            "--profile-middle-result cannot be combined with --profile, --profile-scale, "
+            "--sequence, --dump-dit-residuals, or --profile-prefix-step."
+        )
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -1380,6 +1670,18 @@ def run_slice(args: argparse.Namespace) -> dict[str, Any]:
 
     if args.profile_prefix_step:
         return _profile_prefix_step_quality(
+            args=args,
+            cfg=cfg,
+            sample=sample,
+            sample_input=sample_input,
+            reference=reference,
+            device=device,
+            output_dir=output_dir,
+            local_wan_src=local_wan_src,
+        )
+
+    if args.profile_middle_result:
+        return _profile_middle_result(
             args=args,
             cfg=cfg,
             sample=sample,

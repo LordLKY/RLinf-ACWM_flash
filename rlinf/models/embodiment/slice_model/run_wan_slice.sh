@@ -54,9 +54,16 @@ DIT_RESIDUAL_DIR=${DIT_RESIDUAL_DIR:-"${REPO_ROOT}/profile/wan_slice/dit_residua
 SHARE_INITIAL_NOISE=${SHARE_INITIAL_NOISE:-1}
 
 # profile for prefix denoise-step quality
-PROFILE_PREFIX_STEP=${PROFILE_PREFIX_STEP:-1}
+PROFILE_PREFIX_STEP=${PROFILE_PREFIX_STEP:-0}
 PREFIX_STEPS=${PREFIX_STEPS:-2}
 PREFIX_REFERENCE_BATCH_ID=${PREFIX_REFERENCE_BATCH_ID:-0}
+
+# profile for denoise-step middle result visualization
+PROFILE_MIDDLE_RESULT=${PROFILE_MIDDLE_RESULT:-1}
+MIDDLE_RESULT_DIR=${MIDDLE_RESULT_DIR:-"${REPO_ROOT}/profile/wan_slice/middle_result/${SLICE_NAME}"}
+MIDDLE_RESULT_SAVE_LATENTS=${MIDDLE_RESULT_SAVE_LATENTS:-0}
+MIDDLE_RESULT_GENERATED_ONLY=${MIDDLE_RESULT_GENERATED_ONLY:-1}
+MIDDLE_RESULT_MAX_ENVS=${MIDDLE_RESULT_MAX_ENVS:-8}
 
 is_true() {
   case "${1,,}" in
@@ -64,6 +71,13 @@ is_true() {
     *) return 1 ;;
   esac
 }
+
+if is_true "${PROFILE_MIDDLE_RESULT}"; then
+  PROFILE_SCALE=0
+  SEQUENCE=0
+  DUMP_DIT_RESIDUALS=0
+  PROFILE_PREFIX_STEP=0
+fi
 
 if [[ -n "${GPU}" ]]; then
   export CUDA_VISIBLE_DEVICES="${GPU}"
@@ -130,11 +144,26 @@ elif is_true "${PROFILE_PREFIX_STEP}"; then
     --prefix-steps "${PREFIX_STEPS}"
     --prefix-reference-batch-id "${PREFIX_REFERENCE_BATCH_ID}"
   )
+elif is_true "${PROFILE_MIDDLE_RESULT}"; then
+  cmd+=(
+    --output-dir "${OUTPUT_DIR}"
+    --profile-middle-result
+    --middle-result-dir "${MIDDLE_RESULT_DIR}"
+    --middle-result-max-envs "${MIDDLE_RESULT_MAX_ENVS}"
+  )
+  if is_true "${MIDDLE_RESULT_SAVE_LATENTS}"; then
+    cmd+=(--middle-result-save-latents)
+  fi
+  if is_true "${MIDDLE_RESULT_GENERATED_ONLY}"; then
+    cmd+=(--middle-result-generated-only)
+  else
+    cmd+=(--no-middle-result-generated-only)
+  fi
 else
   cmd+=(--output-dir "${OUTPUT_DIR}")
 fi
 
-if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && ! is_true "${PROFILE_PREFIX_STEP}" && is_true "${SEQUENCE}"; then
+if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && ! is_true "${PROFILE_PREFIX_STEP}" && ! is_true "${PROFILE_MIDDLE_RESULT}" && is_true "${SEQUENCE}"; then
   cmd+=(--sequence --sequence-mode "${SEQUENCE_MODE}")
 fi
 
@@ -154,7 +183,7 @@ if is_true "${SAVE_OUTPUT_CURRENT_OBS_FRAMES}"; then
   cmd+=(--save-output-current-obs-frames)
 fi
 
-if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && ! is_true "${PROFILE_PREFIX_STEP}" && is_true "${DUMP_DIT_RESIDUALS}"; then
+if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && ! is_true "${PROFILE_PREFIX_STEP}" && ! is_true "${PROFILE_MIDDLE_RESULT}" && is_true "${DUMP_DIT_RESIDUALS}"; then
   cmd+=(--dump-dit-residuals --dit-residual-dir "${DIT_RESIDUAL_DIR}")
 fi
 
@@ -182,13 +211,20 @@ elif is_true "${PROFILE_PREFIX_STEP}"; then
   echo "[wan-slice] prefix steps: ${PREFIX_STEPS}"
   echo "[wan-slice] prefix reference batch id: ${PREFIX_REFERENCE_BATCH_ID}"
   echo "[wan-slice] output: ${OUTPUT_DIR}"
+elif is_true "${PROFILE_MIDDLE_RESULT}"; then
+  echo "[wan-slice] mode: profile_middle_result"
+  echo "[wan-slice] middle result dir: ${MIDDLE_RESULT_DIR}"
+  echo "[wan-slice] middle result generated only: ${MIDDLE_RESULT_GENERATED_ONLY}"
+  echo "[wan-slice] middle result save latents: ${MIDDLE_RESULT_SAVE_LATENTS}"
+  echo "[wan-slice] middle result max envs: ${MIDDLE_RESULT_MAX_ENVS}"
+  echo "[wan-slice] output: ${OUTPUT_DIR}"
 elif is_true "${SEQUENCE}"; then
   echo "[wan-slice] mode: sequence/${SEQUENCE_MODE}"
   echo "[wan-slice] output: ${OUTPUT_DIR}"
 else
   echo "[wan-slice] output: ${OUTPUT_DIR}"
 fi
-if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && ! is_true "${PROFILE_PREFIX_STEP}" && is_true "${DUMP_DIT_RESIDUALS}"; then
+if ! is_true "${PROFILE}" && ! is_true "${PROFILE_SCALE}" && ! is_true "${PROFILE_PREFIX_STEP}" && ! is_true "${PROFILE_MIDDLE_RESULT}" && is_true "${DUMP_DIT_RESIDUALS}"; then
   echo "[wan-slice] dit residuals: ${DIT_RESIDUAL_DIR}"
 fi
 if is_true "${SHARE_INITIAL_NOISE}"; then
