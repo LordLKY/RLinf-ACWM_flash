@@ -16,8 +16,8 @@ import asyncio
 import gc
 import json
 import os
-from dataclasses import dataclass, field
 from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -49,7 +49,11 @@ from rlinf.utils.nested_dict_process import (
     update_nested_cfg,
 )
 from rlinf.utils.placement import HybridComponentPlacement
-from rlinf.utils.slice_profile import SliceProfileWriter
+from rlinf.utils.slice_profile import (
+    SliceProfileWriter,
+    profile_data_allows_chunk,
+    profile_data_sampling_metadata,
+)
 from rlinf.utils.utils import (
     flatten_embodied_batch,
     pack_batch,
@@ -1492,6 +1496,16 @@ class EnvWorker(Worker):
         rollout_result: RolloutResult,
         env_output: EnvOutput,
     ) -> None:
+        if not self._profile_vla_data_active():
+            return
+        profile_cfg = self.cfg.get("profile", {})
+        if not profile_data_allows_chunk(
+            profile_cfg,
+            rollout_epoch_id=rollout_epoch_id,
+            chunk_step_idx=chunk_step_idx,
+        ):
+            return
+
         writer = self._ensure_profile_vla_writer()
         if writer is None or not writer.has_capacity:
             return
@@ -1554,6 +1568,7 @@ class EnvWorker(Worker):
                 "num_action_chunks": int(self.model_cfg.num_action_chunks),
                 "action_dim": int(self.model_cfg.action_dim),
                 "filter": "no_done_no_bootstrap_non_cb_no_early_stop",
+                **profile_data_sampling_metadata(profile_cfg),
             },
         )
 

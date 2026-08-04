@@ -21,6 +21,7 @@ import json
 import os
 from collections import deque
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Optional, Union
 
 import numpy as np
@@ -36,6 +37,13 @@ from opensora.utils.inference_utils import prepare_multi_resolution_info
 from rlinf.data.datasets.world_model import NpyTrajectoryDatasetWrapper
 from rlinf.envs.utils import recursive_to_device
 from rlinf.envs.world_model.base_world_env import BaseWorldEnv
+from rlinf.utils.nested_dict_process import clone_nested_to_cpu
+from rlinf.utils.slice_profile import (
+    SliceProfileWriter,
+    profile_data_allows_chunk,
+    profile_data_chunk_index,
+    profile_data_sampling_metadata,
+)
 from rlinf.utils.utils import nvtx_range
 
 __all__ = ["OpenSoraEnv"]
@@ -156,6 +164,7 @@ class OpenSoraEnv(BaseWorldEnv):
         )
         self._is_offloaded = False
         self._init_rollout_profile()
+        self._init_acwm_profile()
 
     def _init_rollout_profile(self):
         profile_cfg = self.cfg.get("profile", {})
@@ -188,6 +197,161 @@ class OpenSoraEnv(BaseWorldEnv):
         self.vae.encode = nvtx_vae_encode
 
         self._rlinf_opensora_nvtx_patched = True
+
+    def _init_acwm_profile(self):
+        profile_cfg = self.cfg.get("profile", {})
+        continuous_cfg = self.cfg.get("continuous_batching", {})
+        self.profile_acwm_data = bool(
+            profile_cfg.get("profile_acwm_data", False)
+        ) and not bool(continuous_cfg.get("enabled", False))
+        self._profile_acwm_writer = None
+        self._profile_acwm_data_dir = None
+        self._profile_acwm_max_groups = int(profile_cfg.get("profile_data_max_groups", 8))
+        if not self.profile_acwm_data:
+            return
+
+        repo_root = Path(__file__).resolve().parents[3]
+        profile_root = Path(profile_cfg.get("profile_data_dir", repo_root / "profile"))
+        worker_rank = self._profile_worker_rank()
+        self._profile_acwm_data_dir = (
+            profile_root
+            / "profile_acwm_data"
+            / f"env_rank{worker_rank:04d}_pid{os.getpid()}"
+        )
+
+    def _ensure_profile_acwm_writer(self):
+        if not self.profile_acwm_data or self._profile_acwm_data_dir is None:
+            return None
+        if self._profile_acwm_writer is None:
+            self._profile_acwm_writer = SliceProfileWriter(
+                self._profile_acwm_data_dir,
+                kind="opensora_wm",
+                worker_label=f"env_rank{self._profile_worker_rank()}",
+                max_groups=self._profile_acwm_max_groups,
+            )
+        return self._profile_acwm_writer
+
+    def _profile_worker_rank(self):
+        if self.worker_info is None:
+            return 0
+        return int(getattr(self.worker_info, "rank", 0))
+
+    def _profile_image_queue_state(self):
+        return [
+            [clone_nested_to_cpu(frame) for frame in self.image_queue[env_idx]]
+            for env_idx in range(self.num_envs)
+        ]
+
+    def _profile_acwm_pre_state(self, policy_output_action):
+        if not self.profile_acwm_data:
+            return None
+        profile_cfg = self.cfg.get("profile", {})
+        if not profile_data_allows_chunk(
+            profile_cfg,
+            elapsed_steps_before=int(self.elapsed_steps),
+            chunk_size=int(self.chunk),
+        ):
+            return None
+
+        writer = self._ensure_profile_acwm_writer()
+        if writer is None or not writer.has_capacity:
+            return None
+        return {
+            "current_obs": clone_nested_to_cpu(self.current_obs),
+            "image_queue": self._profile_image_queue_state(),
+            "policy_output_action": clone_nested_to_cpu(policy_output_action),
+            "reset_state_ids": clone_nested_to_cpu(self.reset_state_ids),
+            "task_descriptions": clone_nested_to_cpu(self.task_descriptions),
+            "init_ee_poses": clone_nested_to_cpu(self.init_ee_poses),
+            "elapsed_steps": int(self.elapsed_steps),
+            "chunk": int(self.chunk),
+            "condition_frame_length": int(self.condition_frame_length),
+            "z_condition_frame_length": int(self.z_condition_frame_length),
+            "z_mask_frame_num": int(self.z_mask_frame_num),
+            "is_vae_v1_2": bool(self.is_vae_v1_2),
+            "image_size": list(self.image_size),
+        }
+
+    def _profile_acwm_record_chunk(
+        self,
+        *,
+        pre_state,
+        policy_output_action,
+        extracted_obs,
+        chunk_rewards,
+        chunk_rewards_tensors,
+        raw_chunk_terminations,
+        raw_chunk_truncations,
+        past_dones,
+        infos,
+    ):
+        writer = self._ensure_profile_acwm_writer()
+        if writer is None or pre_state is None or not writer.has_capacity:
+            return
+        if policy_output_action is None:
+            return
+
+        batch_size = int(policy_output_action.shape[0])
+        group_size = int(self.group_size)
+        if batch_size <= 0 or batch_size % group_size != 0:
+            return
+
+        done_mask = past_dones.detach().cpu().bool().reshape(batch_size)
+        if self.auto_reset and bool(done_mask.any().item()):
+            eligible_groups = torch.zeros(batch_size // group_size, dtype=torch.bool)
+        else:
+            eligible_groups = (~done_mask).reshape(-1, group_size).all(dim=1)
+        if not bool(eligible_groups.any().item()):
+            return
+
+        payload = {
+            "input": pre_state,
+            "output": {
+                "current_obs": self.current_obs,
+                "image_queue": self._profile_image_queue_state(),
+                "extracted_obs": extracted_obs,
+                "chunk_rewards": chunk_rewards,
+                "chunk_rewards_tensors": chunk_rewards_tensors,
+                "raw_chunk_terminations": raw_chunk_terminations,
+                "raw_chunk_truncations": raw_chunk_truncations,
+                "past_dones": past_dones,
+                "infos": infos,
+            },
+            "validity_check": {
+                "past_dones": past_dones,
+                "auto_reset": bool(self.auto_reset),
+            },
+        }
+        writer.record_group_slices(
+            payload,
+            source="opensora_env_chunk_step",
+            batch_size=batch_size,
+            group_size=group_size,
+            eligible_groups=eligible_groups,
+            metadata={
+                "worker_rank": self._profile_worker_rank(),
+                "elapsed_steps_before": int(pre_state["elapsed_steps"]),
+                "elapsed_steps_after": int(self.elapsed_steps),
+                "chunk_step_idx": profile_data_chunk_index(
+                    elapsed_steps_before=int(pre_state["elapsed_steps"]),
+                    chunk_size=int(self.chunk),
+                ),
+                "num_inference_steps": int(
+                    self.world_model_cfg.scheduler.get("num_sampling_steps", -1)
+                ),
+                "condition_frame_length": int(self.condition_frame_length),
+                "z_condition_frame_length": int(self.z_condition_frame_length),
+                "z_mask_frame_num": int(self.z_mask_frame_num),
+                "filter": "no_done_no_auto_reset_non_cb",
+                **profile_data_sampling_metadata(self.cfg.get("profile", {})),
+            },
+        )
+
+    def finalize_profile_acwm_data(self):
+        writer = self._profile_acwm_writer
+        if writer is None:
+            return {}
+        return writer.finalize()
 
     def _build_dataset(self, cfg):
         return NpyTrajectoryDatasetWrapper(cfg.initial_image_path)
@@ -864,6 +1028,7 @@ class OpenSoraEnv(BaseWorldEnv):
         """Execute a chunk of actions"""
         self.onload()
         # policy_output_action: [num_envs, chunk, action_dim]
+        pre_state = self._profile_acwm_pre_state(policy_output_action)
 
         autocast_context = (
             torch.amp.autocast(device_type=self.device.type, dtype=self.inference_dtype)
@@ -916,6 +1081,19 @@ class OpenSoraEnv(BaseWorldEnv):
         infos = self._record_metrics(
             chunk_rewards_tensors.sum(dim=1), past_terminations, infos
         )
+
+        if self.profile_acwm_data:
+            self._profile_acwm_record_chunk(
+                pre_state=pre_state,
+                policy_output_action=policy_output_action,
+                extracted_obs=obs_list[-1],
+                chunk_rewards=chunk_rewards,
+                chunk_rewards_tensors=chunk_rewards_tensors,
+                raw_chunk_terminations=raw_chunk_terminations,
+                raw_chunk_truncations=raw_chunk_truncations,
+                past_dones=past_dones,
+                infos=infos,
+            )
 
         chunk_terminations = torch.zeros_like(raw_chunk_terminations)
         chunk_terminations[:, -1] = past_terminations

@@ -77,6 +77,108 @@ def slice_nested_batch(value: Any, start: int, end: int, batch_size: int) -> Any
     return clone_nested_to_cpu(value)
 
 
+def _profile_cfg_get(profile_cfg: Any, key: str, default: Any = None) -> Any:
+    if profile_cfg is None:
+        return default
+    getter = getattr(profile_cfg, "get", None)
+    if callable(getter):
+        return getter(key, default)
+    return default
+
+
+def _profile_cfg_int(profile_cfg: Any, keys: tuple[str, ...], default: int) -> int:
+    for key in keys:
+        value = _profile_cfg_get(profile_cfg, key, None)
+        if value is not None:
+            return int(value)
+    return int(default)
+
+
+def profile_data_sample_mode(profile_cfg: Any) -> str:
+    return str(
+        _profile_cfg_get(profile_cfg, "profile_data_sample_mode", "first_valid")
+    ).strip().lower()
+
+
+def profile_data_start_chunk(profile_cfg: Any) -> int:
+    return _profile_cfg_int(
+        profile_cfg,
+        ("profile_data_start_chunk", "profile_data_window_start_chunk"),
+        0,
+    )
+
+
+def profile_data_start_rollout_epoch(profile_cfg: Any) -> int:
+    return _profile_cfg_int(
+        profile_cfg,
+        (
+            "profile_data_start_rollout_epoch",
+            "profile_data_window_start_rollout_epoch",
+        ),
+        0,
+    )
+
+
+def profile_data_chunk_index(
+    *,
+    chunk_step_idx: int | None = None,
+    elapsed_steps_before: int | None = None,
+    chunk_size: int | None = None,
+) -> int:
+    if chunk_step_idx is not None:
+        return int(chunk_step_idx)
+    if elapsed_steps_before is not None and chunk_size is not None:
+        chunk_size = int(chunk_size)
+        if chunk_size > 0:
+            return int(elapsed_steps_before) // chunk_size
+    if elapsed_steps_before is not None:
+        return int(elapsed_steps_before)
+    return 0
+
+
+def profile_data_allows_chunk(
+    profile_cfg: Any,
+    *,
+    rollout_epoch_id: int | None = None,
+    chunk_step_idx: int | None = None,
+    elapsed_steps_before: int | None = None,
+    chunk_size: int | None = None,
+) -> bool:
+    mode = profile_data_sample_mode(profile_cfg)
+    if mode in {"first_valid", "first", "head"}:
+        return True
+    if mode not in {"chunk_window", "window"}:
+        raise ValueError(
+            f"Unsupported profile_data_sample_mode={mode!r}. "
+            "Expected 'first_valid' or 'chunk_window'."
+        )
+
+    start_epoch = profile_data_start_rollout_epoch(profile_cfg)
+    if rollout_epoch_id is not None:
+        epoch_id = int(rollout_epoch_id)
+        if epoch_id < start_epoch:
+            return False
+        if epoch_id > start_epoch:
+            return True
+
+    chunk_idx = profile_data_chunk_index(
+        chunk_step_idx=chunk_step_idx,
+        elapsed_steps_before=elapsed_steps_before,
+        chunk_size=chunk_size,
+    )
+    return chunk_idx >= profile_data_start_chunk(profile_cfg)
+
+
+def profile_data_sampling_metadata(profile_cfg: Any) -> dict[str, Any]:
+    return {
+        "profile_data_sample_mode": profile_data_sample_mode(profile_cfg),
+        "profile_data_start_rollout_epoch": profile_data_start_rollout_epoch(
+            profile_cfg
+        ),
+        "profile_data_start_chunk": profile_data_start_chunk(profile_cfg),
+    }
+
+
 class SliceProfileWriter:
     """Bounded writer for group-wise inference slice samples."""
 

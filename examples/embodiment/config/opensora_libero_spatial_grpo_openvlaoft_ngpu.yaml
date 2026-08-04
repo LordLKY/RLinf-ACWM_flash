@@ -15,15 +15,23 @@ hydra:
 
 # Number of GPUs to use. The default reproduces opensora_libero_spatial_grpo_openvlaoft.
 # Override with e.g. `n_gpu=4`.
-n_gpu: 1  # for test
+n_gpu: 2  # for test
 
 profile:
   profile_rollout: False  # for test
+  # for slice-model
+  profile_vla_data: True
+  profile_acwm_data: True
+  profile_data_max_groups: 8
+  profile_data_sample_mode: chunk_window  # first_valid | chunk_window
+  profile_data_start_rollout_epoch: 2
+  profile_data_start_chunk: 8
+  profile_data_dir: ${runner.logger.log_path}
 
 cluster:
   num_nodes: 1
   component_placement:
-    actor,env,rollout: 7-7  # 0-${subtract:${n_gpu},1}  # for test
+    actor,env,rollout: 0-1  # 0-${subtract:${n_gpu},1}  # for test
 
 runner:
   task_type: embodied
@@ -95,7 +103,7 @@ env:
     video_cfg:
       save_video: False # RecordVideo does not forward offload for WanEnv.
   eval:
-    rollout_epoch: 4  # for test
+    rollout_epoch: 8  # for test
     total_num_envs: ${multiply:16,${n_gpu}} # default 496 when n_gpu=8  # for test
     auto_reset: True
     ignore_terminations: True
@@ -156,7 +164,7 @@ actor:
   training_backend: "fsdp"
   micro_batch_size: 32
   # Scaled from the default 8-GPU config: 8192 / 8 = 1024 samples per GPU.
-  global_batch_size: 32  # ${multiply:1024,${n_gpu}}  # for test
+  global_batch_size: 64  # ${multiply:1024,${n_gpu}}  # for test
   seed: 1234
   enable_offload: True
 

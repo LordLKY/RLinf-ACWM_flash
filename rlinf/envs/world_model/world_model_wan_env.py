@@ -32,7 +32,12 @@ from rlinf.data.datasets.world_model import NpyTrajectoryDatasetWrapper
 from rlinf.envs.utils import recursive_to_device
 from rlinf.envs.world_model.base_world_env import BaseWorldEnv
 from rlinf.utils.nested_dict_process import clone_nested_to_cpu
-from rlinf.utils.slice_profile import SliceProfileWriter
+from rlinf.utils.slice_profile import (
+    SliceProfileWriter,
+    profile_data_allows_chunk,
+    profile_data_chunk_index,
+    profile_data_sampling_metadata,
+)
 from rlinf.utils.utils import nvtx_range
 
 __all__ = ["WanEnv", "ContinuousBatchingWanEnv"]
@@ -183,6 +188,16 @@ class WanEnv(BaseWorldEnv):
         return self._profile_acwm_writer
 
     def _profile_acwm_pre_state(self, policy_output_action):
+        if not self.profile_acwm_data:
+            return None
+        profile_cfg = self.cfg.get("profile", {})
+        if not profile_data_allows_chunk(
+            profile_cfg,
+            elapsed_steps_before=int(self.elapsed_steps),
+            chunk_size=int(self.chunk),
+        ):
+            return None
+
         writer = self._ensure_profile_acwm_writer()
         if writer is None or not writer.has_capacity:
             return None
@@ -255,8 +270,13 @@ class WanEnv(BaseWorldEnv):
                 "worker_rank": self._profile_worker_rank(),
                 "elapsed_steps_before": int(pre_state["elapsed_steps"]),
                 "elapsed_steps_after": int(self.elapsed_steps),
+                "chunk_step_idx": profile_data_chunk_index(
+                    elapsed_steps_before=int(pre_state["elapsed_steps"]),
+                    chunk_size=int(self.chunk),
+                ),
                 "num_inference_steps": int(self.num_inference_steps),
                 "filter": "no_done_no_auto_reset_non_cb",
+                **profile_data_sampling_metadata(self.cfg.get("profile", {})),
             },
         )
 
