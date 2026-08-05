@@ -22,5 +22,10 @@ PKG-INFO
 *.egg-info/
 .claude/settings.json
 
-profile/
+/profile/
 outputs
+
+# local config
+/examples/embodiment/config/wan_libero_spatial_grpo_openvlaoft_ngpu.yaml
+/examples/embodiment/config/opensora_libero_spatial_grpo_openvlaoft_ngpu.yaml
+/rlinf/models/embodiment/early_stop_model/early_stop_model_train.yaml
