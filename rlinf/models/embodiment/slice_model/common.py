@@ -226,6 +226,72 @@ def reset_cuda_peak_memory(device: torch.device | str) -> None:
         torch.cuda.reset_peak_memory_stats(device)
 
 
+def clip_similarity_to_reference(
+    input_payload: dict[str, Any],
+    *,
+    reference_batch_id: int,
+    model_name_or_path: str | Path = "openai/clip-vit-large-patch14",
+    device: str | torch.device = "cpu",
+    dtype: str | torch.dtype | None = None,
+    local_files_only: bool = False,
+) -> dict[str, Any]:
+    """Compute CLIP cosine similarity from each latest input frame to one batch lane."""
+
+    current_obs = input_payload.get("current_obs")
+    if current_obs is None:
+        raise ValueError("Cannot compute CLIP similarity: input payload has no current_obs.")
+
+    current_obs_tensor = torch.as_tensor(current_obs)
+    if current_obs_tensor.ndim != 6:
+        raise ValueError(
+            "Expected current_obs shaped [B,C,V,T,H,W] for CLIP similarity, got "
+            f"{tuple(current_obs_tensor.shape)}."
+        )
+
+    batch_size = int(current_obs_tensor.shape[0])
+    reference_batch_id = int(reference_batch_id)
+    if reference_batch_id < 0 or reference_batch_id >= batch_size:
+        raise ValueError(
+            f"reference_batch_id={reference_batch_id} is outside batch size {batch_size}."
+        )
+
+    clip_device = torch.device(device)
+    clip_dtype = None if dtype in (None, "auto") else dtype
+    latest_frames = current_obs_tensor[:, :, 0, -1, :, :].detach().cpu()
+
+    from rlinf.models.embodiment.traj_cache.key_model.clip import (  # noqa: PLC0415
+        build_clip_image_embedder,
+    )
+
+    embedder = None
+    try:
+        embedder = build_clip_image_embedder(
+            model_name_or_path=model_name_or_path,
+            device=clip_device,
+            dtype=clip_dtype,
+            local_files_only=local_files_only,
+        )
+        embeddings = embedder.encode_image(latest_frames, output_device="cpu").float()
+        embeddings = torch.nn.functional.normalize(embeddings, p=2, dim=-1)
+        reference_embedding = embeddings[reference_batch_id]
+        similarities = embeddings @ reference_embedding
+    finally:
+        del embedder
+        if clip_device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return {
+        "reference_batch_id": reference_batch_id,
+        "similarities": [
+            {
+                "batch_id": int(batch_id),
+                "cosine": float(similarities[batch_id].item()),
+            }
+            for batch_id in range(batch_size)
+        ],
+    }
+
+
 def summarize_nested(value: Any) -> Any:
     if isinstance(value, torch.Tensor):
         return {

@@ -40,7 +40,7 @@ CLEAN_OUTPUT=${CLEAN_OUTPUT:-1}
 PROFILE=${PROFILE:-0}
 
 # profile for scale
-PROFILE_SCALE=${PROFILE_SCALE:-1}
+PROFILE_SCALE=${PROFILE_SCALE:-0}
 PROFILE_SCALE_MODULES=${PROFILE_SCALE_MODULES:-1}
 SCALE_BATCH_SIZES=${SCALE_BATCH_SIZES:-1,2,3,4,6,8}
 PROFILE_SCALE_ITERS=${PROFILE_SCALE_ITERS:-10}
@@ -54,9 +54,11 @@ DIT_RESIDUAL_DIR=${DIT_RESIDUAL_DIR:-"${REPO_ROOT}/profile/wan_slice/dit_residua
 SHARE_INITIAL_NOISE=${SHARE_INITIAL_NOISE:-1}
 
 # profile for prefix denoise-step quality
-PROFILE_PREFIX_STEP=${PROFILE_PREFIX_STEP:-0}
-PREFIX_STEPS=${PREFIX_STEPS:-2}
+PROFILE_PREFIX_STEP=${PROFILE_PREFIX_STEP:-1}
+PREFIX_STEPS=${PREFIX_STEPS:-3}
 PREFIX_REFERENCE_BATCH_ID=${PREFIX_REFERENCE_BATCH_ID:-0}
+PREFIX_INPUT_CLIP_SIMILARITY=${PREFIX_INPUT_CLIP_SIMILARITY:-1}
+CLIP_MODEL_NAME_OR_PATH=${CLIP_MODEL_NAME_OR_PATH:-openai/clip-vit-large-patch14}
 
 # profile for denoise-step middle result visualization
 PROFILE_MIDDLE_RESULT=${PROFILE_MIDDLE_RESULT:-0}
@@ -144,6 +146,12 @@ elif is_true "${PROFILE_PREFIX_STEP}"; then
     --prefix-steps "${PREFIX_STEPS}"
     --prefix-reference-batch-id "${PREFIX_REFERENCE_BATCH_ID}"
   )
+  if is_true "${PREFIX_INPUT_CLIP_SIMILARITY}"; then
+    cmd+=(
+      --prefix-input-clip-similarity
+      --clip-model-name-or-path "${CLIP_MODEL_NAME_OR_PATH}"
+    )
+  fi
 elif is_true "${PROFILE_MIDDLE_RESULT}"; then
   cmd+=(
     --output-dir "${OUTPUT_DIR}"
@@ -210,6 +218,9 @@ elif is_true "${PROFILE_PREFIX_STEP}"; then
   echo "[wan-slice] mode: profile_prefix_step"
   echo "[wan-slice] prefix steps: ${PREFIX_STEPS}"
   echo "[wan-slice] prefix reference batch id: ${PREFIX_REFERENCE_BATCH_ID}"
+  if is_true "${PREFIX_INPUT_CLIP_SIMILARITY}"; then
+    echo "[wan-slice] prefix input CLIP similarity: ${CLIP_MODEL_NAME_OR_PATH}"
+  fi
   echo "[wan-slice] output: ${OUTPUT_DIR}"
 elif is_true "${PROFILE_MIDDLE_RESULT}"; then
   echo "[wan-slice] mode: profile_middle_result"

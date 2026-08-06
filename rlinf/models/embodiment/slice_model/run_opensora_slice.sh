@@ -32,7 +32,7 @@ LOCAL_OPENSORA_SRC=${LOCAL_OPENSORA_SRC:-"${SCRIPT_DIR}/local_src/opensora"}
 PROFILE=${PROFILE:-0}
 
 # profile for scale
-PROFILE_SCALE=${PROFILE_SCALE:-1}
+PROFILE_SCALE=${PROFILE_SCALE:-0}
 PROFILE_SCALE_MODULES=${PROFILE_SCALE_MODULES:-1}
 SCALE_BATCH_SIZES=${SCALE_BATCH_SIZES:-1,2,4,8,16,24}
 PROFILE_SCALE_ITERS=${PROFILE_SCALE_ITERS:-10}
@@ -42,8 +42,10 @@ PROFILE_SCALE_EMPTY_CACHE=${PROFILE_SCALE_EMPTY_CACHE:-1}
 
 # profile for prefix denoise-step quality
 PROFILE_PREFIX_STEP=${PROFILE_PREFIX_STEP:-1}
-PREFIX_STEPS=${PREFIX_STEPS:-6}
-PREFIX_REFERENCE_BATCH_ID=${PREFIX_REFERENCE_BATCH_ID:-2}
+PREFIX_STEPS=${PREFIX_STEPS:-5}
+PREFIX_REFERENCE_BATCH_ID=${PREFIX_REFERENCE_BATCH_ID:-0}
+PREFIX_INPUT_CLIP_SIMILARITY=${PREFIX_INPUT_CLIP_SIMILARITY:-1}
+CLIP_MODEL_NAME_OR_PATH=${CLIP_MODEL_NAME_OR_PATH:-openai/clip-vit-large-patch14}
 
 # profile for denoise-step middle result visualization
 PROFILE_MIDDLE_RESULT=${PROFILE_MIDDLE_RESULT:-0}
@@ -136,6 +138,12 @@ elif is_true "${PROFILE_PREFIX_STEP}"; then
     --prefix-steps "${PREFIX_STEPS}"
     --prefix-reference-batch-id "${PREFIX_REFERENCE_BATCH_ID}"
   )
+  if is_true "${PREFIX_INPUT_CLIP_SIMILARITY}"; then
+    cmd+=(
+      --prefix-input-clip-similarity
+      --clip-model-name-or-path "${CLIP_MODEL_NAME_OR_PATH}"
+    )
+  fi
 elif is_true "${PROFILE_MIDDLE_RESULT}"; then
   cmd+=(
     --output-dir "${OUTPUT_DIR}"
@@ -190,6 +198,9 @@ elif is_true "${PROFILE_PREFIX_STEP}"; then
   echo "[opensora-slice] mode: profile_prefix_step"
   echo "[opensora-slice] prefix steps: ${PREFIX_STEPS}"
   echo "[opensora-slice] prefix reference batch id: ${PREFIX_REFERENCE_BATCH_ID}"
+  if is_true "${PREFIX_INPUT_CLIP_SIMILARITY}"; then
+    echo "[opensora-slice] prefix input CLIP similarity: ${CLIP_MODEL_NAME_OR_PATH}"
+  fi
   echo "[opensora-slice] output: ${OUTPUT_DIR}"
 elif is_true "${PROFILE_MIDDLE_RESULT}"; then
   echo "[opensora-slice] mode: profile_middle_result"

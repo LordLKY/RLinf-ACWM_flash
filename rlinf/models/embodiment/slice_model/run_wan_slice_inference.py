@@ -29,6 +29,7 @@ from PIL import Image, ImageDraw
 
 from rlinf.models.embodiment.slice_model.common import (
     bytes_to_gb,
+    clip_similarity_to_reference,
     cuda_memory_snapshot,
     default_local_src_dir,
     export_acwm_input,
@@ -40,17 +41,16 @@ from rlinf.models.embodiment.slice_model.common import (
     parse_batch_sizes,
     prepend_local_src,
     repo_root,
-    reset_export_dir,
     reset_cuda_peak_memory,
-    save_json,
+    reset_export_dir,
     save_image,
+    save_json,
     save_pt,
     scale_nested_batch,
     tensor_diff_summary,
 )
 from rlinf.scheduler import Worker
 from rlinf.utils.utils import nvtx_range
-
 
 PROFILE_ITERATIONS = 10
 DEFAULT_DIT_RESIDUAL_DIR = repo_root() / "profile" / "wan_slice" / "dit_residual"
@@ -291,6 +291,34 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Batch lane used as the shared denoise prefix representative.",
+    )
+    parser.add_argument(
+        "--prefix-input-clip-similarity",
+        action="store_true",
+        help=(
+            "With --profile-prefix-step, compute CLIP similarity from each batch "
+            "lane's latest input frame to --prefix-reference-batch-id."
+        ),
+    )
+    parser.add_argument(
+        "--clip-model-name-or-path",
+        default="openai/clip-vit-large-patch14",
+        help="CLIP image encoder model id or local path for --prefix-input-clip-similarity.",
+    )
+    parser.add_argument(
+        "--clip-device",
+        default="cuda",
+        help="Device for CLIP similarity analysis.",
+    )
+    parser.add_argument(
+        "--clip-dtype",
+        default="auto",
+        help="CLIP inference dtype: auto, fp32, fp16, or bf16.",
+    )
+    parser.add_argument(
+        "--clip-local-files-only",
+        action="store_true",
+        help="Load the CLIP model from local Hugging Face cache/files only.",
     )
     parser.add_argument(
         "--profile-middle-result",
@@ -971,6 +999,21 @@ def _profile_prefix_step_quality(
     if args.prefix_steps < 0:
         raise ValueError("--prefix-steps must be non-negative.")
 
+    clip_similarity = None
+    if args.prefix_input_clip_similarity:
+        clip_similarity = clip_similarity_to_reference(
+            sample_input,
+            reference_batch_id=args.prefix_reference_batch_id,
+            model_name_or_path=args.clip_model_name_or_path,
+            device=args.clip_device,
+            dtype=args.clip_dtype,
+            local_files_only=args.clip_local_files_only,
+        )
+        save_json(
+            clip_similarity,
+            output_dir / "clip_similarity_to_prefix_reference.json",
+        )
+
     env, num_envs = _create_wan_env(cfg, sample_input, device)
     if args.prefix_reference_batch_id < 0 or args.prefix_reference_batch_id >= num_envs:
         raise ValueError(
@@ -1067,11 +1110,16 @@ def _profile_prefix_step_quality(
         baseline=baseline,
         reference=reference,
     )
+    if clip_similarity is not None:
+        summary["clip_similarity_to_prefix_reference"] = clip_similarity
     save_json(timing, output_dir / "timing.json")
     save_json(metadata, output_dir / "metadata.json")
     save_json(diff, output_dir / "diff.json")
     _write_prefix_quality_summary(summary, output_dir)
-    return {"metadata": metadata, "timing": timing, "diff": diff}
+    result = {"metadata": metadata, "timing": timing, "diff": diff}
+    if clip_similarity is not None:
+        result["clip_similarity_to_prefix_reference"] = clip_similarity
+    return result
 
 
 def _profile_middle_result(
